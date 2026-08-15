@@ -1,0 +1,17 @@
+# build artifacts
+*.o
+*.ko
+*.mod*
+*.cmd
+.tmp_versions/
+*.deb
+
+# kernel tree and archives — too large for git
+linux-6.16.1/
+*.tar.gz
+*.zip
+
+# experiment output
+results/
+*.log
+__pycache__/
