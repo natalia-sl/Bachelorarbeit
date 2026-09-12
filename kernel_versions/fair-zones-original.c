@@ -1926,10 +1926,24 @@ static void numa_promotion_adjust_threshold(struct pglist_data *pgdat,
 
 /*
  * NBP histogram: self-tuning promotion threshold from hint-fault latency.
+ *
+ * Static log-linear ("fractional log2") bucket geometry, anchored to the
+ * hint-fault latency floor (2^NBP_HIST_FLOOR_SHIFT ms ~= the minimum scan
+ * period), a property of the scanning machinery rather than the workload.
+ * Each octave above the floor splits into 4 sub-buckets (top two mantissa
+ * bits), giving ~25% relative resolution across the hot band; the unbounded
+ * cold tail collapses into the last bucket where it cannot distort geometry.
+ * Static geometry means decay-halving never invalidates bucket meanings.
+ *
+ * Layout with FLOOR_SHIFT = 9 (unit = 512 ms):
+ *   buckets  0..3 :  512 ms wide   [    0,  2048) ms
+ *   buckets  4..7 :  512 ms wide   [ 2048,  4096) ms
+ *   buckets  8..11: 1024 ms wide   [ 4096,  8192) ms
+ *   buckets 12..15: 2048 ms wide   [ 8192, 16384) ms, tail clamps into 15
  */
-#define NBP_HIST_BUCKETS	10
-#define NBP_BUCKET_MS		(NBP_PRUNE_MS / NBP_HIST_BUCKETS)
+#define NBP_HIST_BUCKETS	16
 #define NBP_TARGET_PCT		10	/* promote hottest ~10% of faults */
+#define NBP_HIST_FLOOR_SHIFT	9	/* ~ilog2(scan_period_min) */
 
 static unsigned int nbp_hist[NBP_HIST_BUCKETS];
 static unsigned int nbp_hist_start;	/* decay epoch timestamp */
@@ -2078,7 +2092,9 @@ static unsigned long nbp_rebal_skips;	/* skipped: too few samples */
 
 static unsigned int nbp_hist_nbuckets(void)
 {
-	return nbp_spacing == 4 ? nbp_nbuckets : NBP_HIST_BUCKETS;
+	switch (nbp_spacing) {
+	case 4:	 return nbp_nbuckets;
+	default: return 10;
 	}
 }
 

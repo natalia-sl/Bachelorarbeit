@@ -32,13 +32,9 @@ GAPBS_DIR="$HOME/gapbs"
 ROCKSDB_DIR="$HOME/rocksdb"
 YCSB_DIR="$HOME/ycsb"
 YCSB_VERSION="${YCSB_VERSION:-0.17.0}"
-DLRM_DIR="$HOME/dlrm"
-DLRM_VENV="$HOME/dlrm-venv"
 
 # node-local scratch for the RocksDB dataset - NEVER the NFS home
 DB_DIR="${DB_DIR:-/var/tmp/db_bench}"
-# node-local scratch for DLRM's tensorboard event files - NEVER the NFS home
-DLRM_SCRATCH="${DLRM_SCRATCH:-/var/tmp/dlrm}"
 
 WARNINGS=()
 step() { echo; echo "===== $* ====="; }
@@ -163,8 +159,7 @@ sudo apt install -y \
   build-essential pkg-config flex bison python3 numactl git wget curl unzip \
   libelf-dev libdw-dev libtraceevent-dev \
   redis-server redis-tools openjdk-11-jre-headless \
-  libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev \
-  python3-venv python3-pip
+  libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev
 
 step "gapbs"
 if [[ -x "$GAPBS_DIR/bfs" && "$FORCE_BUILD" != "1" ]]; then
@@ -262,52 +257,6 @@ else
   echo "no dataset yet - run-bench-variant.sh loads it once on first 'db' run"
 fi
 
-step "dlrm + pytorch venv"
-# The venv lives in the shared home alongside gapbs/ycsb, so it is built once
-# and every node imports the same torch. It is ~2 GB, hence the build lock.
-if [[ -x "$DLRM_VENV/bin/python" && -f "$DLRM_DIR/dlrm_s_pytorch.py" && "$FORCE_BUILD" != "1" ]]; then
-  echo "dlrm + venv already present ($DLRM_DIR, $DLRM_VENV)"
-else
-  if with_build_lock "$DLRM_VENV"; then
-    [[ -d "$DLRM_DIR/.git" ]] || git clone --depth 1 https://github.com/facebookresearch/dlrm.git "$DLRM_DIR"
-    [[ -x "$DLRM_VENV/bin/python" ]] || python3 -m venv "$DLRM_VENV"
-    # --index-url cpu is not optional: the default PyPI torch wheel drags in
-    # several GB of nvidia-* CUDA packages that this box will never use.
-    # numpy is pinned below 2 because DLRM predates it and torch only handles
-    # numpy 2 from 2.3 onward - the combination fails at import, not at run.
-    # --no-cache-dir keeps pip from leaving a multi-GB cache on the NFS home.
-    "$DLRM_VENV/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel \
-      || warn "pip bootstrap failed"
-    "$DLRM_VENV/bin/pip" install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cpu torch \
-      || warn "torch (cpu) install failed"
-    # torch.utils.tensorboard is imported unconditionally by dlrm_s_pytorch.py,
-    # so the tensorboard package is a hard dependency even though we never look
-    # at the event files.
-    "$DLRM_VENV/bin/pip" install --no-cache-dir "numpy<2" scikit-learn tensorboard \
-      || warn "dlrm python deps install failed"
-  fi
-fi
-if [[ -x "$DLRM_VENV/bin/python" ]]; then
-  "$DLRM_VENV/bin/python" - <<'PY' || warn "dlrm python stack is not importable"
-import torch, numpy, sklearn
-from torch.utils.tensorboard import SummaryWriter
-print("torch", torch.__version__, "numpy", numpy.__version__, "threads", torch.get_num_threads())
-PY
-else
-  warn "no $DLRM_VENV/bin/python"
-fi
-[[ -f "$DLRM_DIR/dlrm_s_pytorch.py" ]] || warn "no $DLRM_DIR/dlrm_s_pytorch.py"
-
-step "dlrm scratch directory (node-local)"
-sudo mkdir -p "$DLRM_SCRATCH"
-sudo chown "$(id -un):$(id -gn)" "$DLRM_SCRATCH"
-DLRM_FSTYPE="$(stat -f -c %T "$DLRM_SCRATCH" 2>/dev/null || echo unknown)"
-echo "$DLRM_SCRATCH: fstype=$DLRM_FSTYPE"
-case "$DLRM_FSTYPE" in
-  nfs*) warn "$DLRM_SCRATCH is on NFS - tensorboard writeback will land on the shared export mid-run" ;;
-esac
-
 step "perf"
 # The distro perf often refuses to run against a self-built kernel. Build the
 # one from the kernel tree instead; NO_JEVENTS/NO_LIBTRACEEVENT drop the
@@ -340,9 +289,7 @@ printf '%-28s %s\n' \
   "redis-server"  "$(command -v redis-server >/dev/null && echo ok || echo MISSING)" \
   "ycsb"          "$([[ -x $YCSB_DIR/bin/ycsb.sh ]] && echo ok || echo MISSING)" \
   "db_bench"      "$([[ -x $ROCKSDB_DIR/db_bench ]] && echo ok || echo MISSING)" \
-  "db dataset dir" "$DB_DIR ($DB_FSTYPE)" \
-  "dlrm"          "$([[ -f $DLRM_DIR/dlrm_s_pytorch.py ]] && echo ok || echo MISSING)" \
-  "dlrm venv"     "$([[ -x $DLRM_VENV/bin/python ]] && echo ok || echo MISSING)"
+  "db dataset dir" "$DB_DIR ($DB_FSTYPE)"
 
 if [[ ${#WARNINGS[@]} -eq 0 ]]; then
   echo; echo "Done - no warnings."
@@ -358,7 +305,6 @@ Next:
     ./run-bench-variant.sh db hist 1 5
   ./run-bench-variant.sh redis hist 1 5
   ./run-bench-variant.sh pr hist 1 5
-  ./run-bench-variant.sh dlrm hist 1 5
 
 After a reboot only the runtime state is lost:
   ACTIVATE_ONLY=1 ./tiers_setup.sh

@@ -21,7 +21,6 @@ declare -A APPS=(
   [bc]="bash app_bc.sh"
   [bfs_cc]="bash app_bfs_cc.sh"
   [redis]="bash app_redis_ycsb.sh"
-  [dlrm]="bash app_dlrm.sh"
 )
 # ------------------------------------------------------------------------
 
@@ -45,25 +44,6 @@ SCALE="${SCALE:-27}"                       # GAP -u scale, used when generating
 DEGREE="${DEGREE:-20}"                     # GAP -k degree, used when generating
 YCSB_THREADS="${YCSB_THREADS:-16}"         # YCSB client threads (load AND run)
 JVM_HEAP="${JVM_HEAP:-4g}"                 # cap the YCSB JVM so it doesn't eat node 0
-
-# DLRM. Resolved here for the same reason as the rest: under sudo the app sees
-# $HOME=/root, so the venv and the checkout have to be handed over explicitly.
-# Footprint = TABLES*ROWS*DIM*4 B; the defaults below are 19.1 GiB of embedding
-# tables, ~3x node 0. DLRM_SIGMA is in ROW units and sets the hot set
-# independently of the footprint (+-3 sigma ~ 2.9 GiB here, so it fits node 0).
-DLRM_VENV="${DLRM_VENV:-$HOME/dlrm-venv}"
-DLRM_HOME="${DLRM_HOME:-$HOME/dlrm}"
-DLRM_PY="${DLRM_PY:-$DLRM_HOME/dlrm_s_pytorch.py}"
-DLRM_PYTHON="${DLRM_PYTHON:-$DLRM_VENV/bin/python}"
-DLRM_SCRATCH="${DLRM_SCRATCH:-/var/tmp/dlrm}"   # node-local, NEVER the NFS home
-DLRM_TABLES="${DLRM_TABLES:-8}"
-DLRM_ROWS="${DLRM_ROWS:-5000000}"
-DLRM_DIM="${DLRM_DIM:-128}"
-DLRM_MBS="${DLRM_MBS:-2048}"
-DLRM_BATCHES="${DLRM_BATCHES:-1000}"
-DLRM_IDX="${DLRM_IDX:-50}"
-DLRM_SIGMA="${DLRM_SIGMA:-125000}"
-DLRM_THREADS="${DLRM_THREADS:-8}"          # keep equal to the taskset core count
 # ------------------------------------------------------------------------
 
 # --- NBP histogram instrumentation (harmless on non-histogram kernels) --
@@ -116,9 +96,9 @@ diagnose_hang() {
   echo "--- NFS / hung task messages ---"
   sudo dmesg 2>/dev/null | grep -iE 'nfs|hung task|blocked for more than' | tail -20 || echo "(none)"
   echo "--- benchmark processes (STAT D = uninterruptible; WCHAN = where it is stuck) ---"
-  ps -eo pid,ppid,stat,wchan:32,rss,etime,comm | grep -E 'bfs|cc|pr|bc|redis|java|python|perf' | grep -v grep
+  ps -eo pid,ppid,stat,wchan:32,rss,etime,comm | grep -E 'bfs|cc|pr|bc|redis|java|perf' | grep -v grep
   echo "--- kernel stacks ---"
-  for pid in $(pgrep -f 'gapbs/(bfs|cc|pr|bc)|redis-server|dlrm_s_pytorch' 2>/dev/null); do
+  for pid in $(pgrep -f 'gapbs/(bfs|cc|pr|bc)|redis-server' 2>/dev/null); do
     echo "pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null)):"
     sudo cat "/proc/$pid/stack" 2>/dev/null | head -20 || echo "  (stack unavailable)"
   done
@@ -133,14 +113,12 @@ kill_stragglers() {
   redis-cli -h 127.0.0.1 -p 6379 shutdown nosave >/dev/null 2>&1 || true
   sudo pkill -f 'gapbs/(bfs|cc|pr|bc)' 2>/dev/null || true
   sudo pkill -f 'ycsb' 2>/dev/null || true
-  sudo pkill -f 'dlrm_s_pytorch' 2>/dev/null || true
   sleep 3
   sudo pkill -9 -f 'gapbs/(bfs|cc|pr|bc)' 2>/dev/null || true
   sudo pkill -9 -f 'ycsb' 2>/dev/null || true
-  sudo pkill -9 -f 'dlrm_s_pytorch' 2>/dev/null || true
   sleep 2
   echo "still running:"
-  ps -eo pid,stat,comm | grep -E 'bfs|cc|pr|redis|java|python' | grep -v grep || echo "(none)"
+  ps -eo pid,stat,comm | grep -E 'bfs|cc|pr|redis|java' | grep -v grep || echo "(none)"
 }
 
 # record the runtime knob state - VAR is only a label, this is the ground truth
@@ -163,7 +141,6 @@ CMD="${APPS[$APP]:-}"
 if [[ -z "${MAXSEC:-}" ]]; then
   case "$APP" in
     redis) MAXSEC=10800 ;;
-    dlrm)  MAXSEC=10800 ;;   # table init alone is minutes before the first iter
     *)     MAXSEC=3600  ;;
   esac
 fi
@@ -186,19 +163,6 @@ fi
 if [[ -n "$GRAPH" && ! -f "$GRAPH" ]]; then
   echo "NOTE: graph '$GRAPH' not found - GAP apps will generate in-process." >&2
   echo "      To use a file instead: ./gapbs/converter -u 27 -k 20 -b $GRAPH  (~22.5 GB)" >&2
-fi
-
-# DLRM needs its interpreter and its checkout to exist BEFORE the reps start;
-# discovering this inside rep 1, under sudo, costs a whole preflight cycle.
-if [[ "$APP" == "dlrm" ]]; then
-  [[ -x "$DLRM_PYTHON" ]] || { echo "ERROR: no venv python at $DLRM_PYTHON - run ./tiers_setup.sh" >&2; exit 1; }
-  [[ -f "$DLRM_PY"     ]] || { echo "ERROR: no $DLRM_PY - run ./tiers_setup.sh" >&2; exit 1; }
-  dlrm_gb=$(awk -v t="$DLRM_TABLES" -v r="$DLRM_ROWS" -v d="$DLRM_DIM" \
-            'BEGIN{printf "%.1f", t*r*d*4/1024/1024/1024}')
-  echo "NOTE: DLRM embedding footprint = ${dlrm_gb} GiB (${DLRM_TABLES} x ${DLRM_ROWS} x ${DLRM_DIM} x 4 B)"
-  # np.random.uniform builds each table as float64 and then casts, so the peak
-  # during init runs well above the steady-state footprint.
-  echo "      init peak is ~2x one table above that; total RAM = ${MEM_TOTAL_GB} GB"
 fi
 
 # If the results volume is on a hung NFS mount, every write below blocks in
@@ -379,17 +343,6 @@ for rep in $(seq 1 "$REPS"); do
         /usr/bin/time --verbose \
         perf stat -a --per-socket -e "$EVENTS" \
         -- env OUT="$APPOUT" \
-               PYTHON="$DLRM_PYTHON" \
-               DLRM_PY="$DLRM_PY" \
-               DLRM_SCRATCH="$DLRM_SCRATCH" \
-               DLRM_TABLES="$DLRM_TABLES" \
-               DLRM_ROWS="$DLRM_ROWS" \
-               DLRM_DIM="$DLRM_DIM" \
-               DLRM_MBS="$DLRM_MBS" \
-               DLRM_BATCHES="$DLRM_BATCHES" \
-               DLRM_IDX="$DLRM_IDX" \
-               DLRM_SIGMA="$DLRM_SIGMA" \
-               DLRM_THREADS="$DLRM_THREADS" \
                GRAPH="$GRAPH" \
                TRIALS="$TRIALS" \
                THREADS="$YCSB_THREADS" \
@@ -489,9 +442,6 @@ for rep in $(seq 1 "$REPS"); do
     elif [[ "$APP" == "redis" ]]; then
         # Parse the YCSB wrapper output
         avg=$(grep -m1 '^\[YCSB\] Average Time' "$log" | awk '{print $NF}')
-    elif [[ "$APP" == "dlrm" ]]; then
-        # seconds per iteration, warm-up window already excluded by the app script
-        avg=$(grep -m1 '^\[DLRM\] Average Time' "$log" | awk '{print $NF}')
     else
         avg=$(grep -m1 'Average Time' "$log" | awk '{print $NF}')
     fi
