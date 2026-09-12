@@ -284,15 +284,24 @@ else
     # torch.utils.tensorboard is imported unconditionally by dlrm_s_pytorch.py,
     # so the tensorboard package is a hard dependency even though we never look
     # at the event files.
-    "$DLRM_VENV/bin/pip" install --no-cache-dir "numpy<2" scikit-learn tensorboard \
+    # tqdm is not optional despite looking like it: dlrm_data_pytorch.py imports
+    # data_loader_terabyte at module scope, and that file imports tqdm at its
+    # own module scope, so it is pulled in even on a pure --data-generation=random
+    # run that never touches the terabyte loader.
+    "$DLRM_VENV/bin/pip" install --no-cache-dir "numpy<2" scikit-learn tensorboard tqdm \
       || warn "dlrm python deps install failed"
   fi
 fi
-if [[ -x "$DLRM_VENV/bin/python" ]]; then
-  "$DLRM_VENV/bin/python" - <<'PY' || warn "dlrm python stack is not importable"
+if [[ -x "$DLRM_VENV/bin/python" && -d "$DLRM_DIR" ]]; then
+  # Import DLRM's OWN data module rather than a hand-written list of packages:
+  # that pulls in every transitive dependency the real run will hit (tqdm comes
+  # in this way), so a missing one fails here instead of inside rep 1.
+  ( cd "$DLRM_DIR" && "$DLRM_VENV/bin/python" - <<'PY' ) || warn "dlrm python stack is not importable"
 import torch, numpy, sklearn
+import dlrm_data_pytorch
 from torch.utils.tensorboard import SummaryWriter
 print("torch", torch.__version__, "numpy", numpy.__version__, "threads", torch.get_num_threads())
+print("dlrm_data_pytorch imports cleanly")
 PY
 else
   warn "no $DLRM_VENV/bin/python"

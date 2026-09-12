@@ -17,7 +17,15 @@
 # here (we run under sudo), so PYTHON and DLRM_PY must be passed in explicitly.
 set -uo pipefail
 
+# The harness hands us a RELATIVE OUT ("results/<node>/..."), which every other
+# app script gets away with because none of them changes directory. This one
+# does (see SCRATCH below), so resolve it while the CWD is still the harness's.
 OUT="${OUT:-.}"
+if [[ -d "$OUT" ]]; then
+  OUT="$(cd "$OUT" && pwd)"
+else
+  echo "[DLRM] OUT directory '$OUT' does not exist (cwd: $PWD)" >&2; exit 1
+fi
 PYTHON="${PYTHON:?app_dlrm.sh needs PYTHON=<venv python> passed in}"
 DLRM_PY="${DLRM_PY:?app_dlrm.sh needs DLRM_PY=<path to dlrm_s_pytorch.py> passed in}"
 SCRATCH="${DLRM_SCRATCH:-/var/tmp/dlrm}"
