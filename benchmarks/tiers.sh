@@ -292,17 +292,45 @@ else
       || warn "dlrm python deps install failed"
   fi
 fi
+# DLRM's last commit predates torch 2.x. torch.autograd.profiler.profile() no
+# longer accepts use_cuda=, so the unconditional `with` around the whole training
+# loop raises TypeError before the first iteration. The block is entered with
+# enabled=args.enable_profiling, which the harness never sets, so the profiler is
+# a no-op and the kwarg can simply go. grep-guarded, so re-running is harmless,
+# and it stays visible in `git -C $DLRM_DIR diff` for the writeup.
+if [[ -f "$DLRM_DIR/dlrm_s_pytorch.py" ]]; then
+  if grep -q 'use_cuda=use_gpu, record_shapes=True' "$DLRM_DIR/dlrm_s_pytorch.py"; then
+    sed -i 's/args\.enable_profiling, use_cuda=use_gpu, record_shapes=True/args.enable_profiling, record_shapes=True/' \
+      "$DLRM_DIR/dlrm_s_pytorch.py" \
+      && echo "patched dlrm_s_pytorch.py: dropped the removed use_cuda= profiler kwarg" \
+      || warn "failed to patch the use_cuda= profiler kwarg"
+  else
+    echo "dlrm_s_pytorch.py already patched (no use_cuda= profiler kwarg)"
+  fi
+fi
+
 if [[ -x "$DLRM_VENV/bin/python" && -d "$DLRM_DIR" ]]; then
-  # Import DLRM's OWN data module rather than a hand-written list of packages:
-  # that pulls in every transitive dependency the real run will hit (tqdm comes
-  # in this way), so a missing one fails here instead of inside rep 1.
-  ( cd "$DLRM_DIR" && "$DLRM_VENV/bin/python" - <<'PY' ) || warn "dlrm python stack is not importable"
-import torch, numpy, sklearn
-import dlrm_data_pytorch
-from torch.utils.tensorboard import SummaryWriter
-print("torch", torch.__version__, "numpy", numpy.__version__, "threads", torch.get_num_threads())
-print("dlrm_data_pytorch imports cleanly")
-PY
+  "$DLRM_VENV/bin/python" -c \
+    'import torch, numpy, sklearn; print("torch", torch.__version__, "numpy", numpy.__version__)' \
+    || warn "torch/numpy/sklearn not importable in $DLRM_VENV"
+
+  # A two-second run of the tiny default model, end to end. An import check only
+  # proves the modules load; this exercises the argument plumbing, the training
+  # loop and the profiler context that just broke, AND confirms the "ms/it" line
+  # that app_dlrm.sh parses still looks the way it does. Any remaining torch-2
+  # API break surfaces here instead of twenty minutes into rep 1.
+  mkdir -p "$DLRM_SCRATCH" 2>/dev/null
+  SMOKE="$(cd "$DLRM_SCRATCH" 2>/dev/null && "$DLRM_VENV/bin/python" \
+             "$DLRM_DIR/dlrm_s_pytorch.py" --mini-batch-size=2 --data-size=6 \
+             --print-time --print-freq=1 --tensor-board-filename=smoke_tb 2>&1)"
+  if grep -q 'ms/it' <<<"$SMOKE"; then
+    echo "dlrm smoke run ok:"
+    grep 'ms/it' <<<"$SMOKE" | tail -1
+  else
+    warn "dlrm smoke run failed - see below"
+    tail -15 <<<"$SMOKE"
+  fi
+  rm -rf "$DLRM_SCRATCH/smoke_tb"
 else
   warn "no $DLRM_VENV/bin/python"
 fi
@@ -351,7 +379,8 @@ printf '%-28s %s\n' \
   "db_bench"      "$([[ -x $ROCKSDB_DIR/db_bench ]] && echo ok || echo MISSING)" \
   "db dataset dir" "$DB_DIR ($DB_FSTYPE)" \
   "dlrm"          "$([[ -f $DLRM_DIR/dlrm_s_pytorch.py ]] && echo ok || echo MISSING)" \
-  "dlrm venv"     "$([[ -x $DLRM_VENV/bin/python ]] && echo ok || echo MISSING)"
+  "dlrm venv"     "$([[ -x $DLRM_VENV/bin/python ]] && echo ok || echo MISSING)" \
+  "dlrm profiler patch" "$(grep -q 'use_cuda=use_gpu' "$DLRM_DIR/dlrm_s_pytorch.py" 2>/dev/null && echo "NOT APPLIED" || echo applied)"
 
 if [[ ${#WARNINGS[@]} -eq 0 ]]; then
   echo; echo "Done - no warnings."
