@@ -34,6 +34,7 @@ YCSB_DIR="$HOME/ycsb"
 YCSB_VERSION="${YCSB_VERSION:-0.17.0}"
 DLRM_DIR="$HOME/dlrm"
 DLRM_VENV="$HOME/dlrm-venv"
+XSBENCH_DIR="$HOME/XSBench"
 
 # node-local scratch for the RocksDB dataset - NEVER the NFS home
 DB_DIR="${DB_DIR:-/var/tmp/db_bench}"
@@ -262,6 +263,33 @@ else
   echo "no dataset yet - run-bench-variant.sh loads it once on first 'db' run"
 fi
 
+step "xsbench"
+# Only the openmp-threading port is usable here. The cuda/hip/opencl/sycl and
+# openmp-offload ports copy the grids into device memory, where
+# task_numa_work() never scans them and every migration counter stays flat.
+if [[ -x "$XSBENCH_DIR/openmp-threading/XSBench" && "$FORCE_BUILD" != "1" ]]; then
+  echo "XSBench already built at $XSBENCH_DIR/openmp-threading"
+else
+  if with_build_lock "$XSBENCH_DIR"; then
+    [[ -d "$XSBENCH_DIR/.git" ]] || git clone https://github.com/ANL-CESAR/XSBench.git "$XSBENCH_DIR"
+    ( cd "$XSBENCH_DIR/openmp-threading" && make -j"$(nproc)" ) || warn "XSBench build failed"
+  fi
+fi
+if [[ -x "$XSBENCH_DIR/openmp-threading/XSBench" ]]; then
+  # Footprint is set by -g at -s large (355 nuclides): MB ~= g/2.
+  # 96.2% of it is the unionized index grid, hit thinly and uniformly; the hot
+  # set is the nuclide grid + energy array, ~3.8%, allocated and first-touched
+  # FIRST - so under plain first-touch it lands on node 0 and promotion has
+  # nothing to do. Ballast node 0 if you want to measure promotion.
+  n0mb=$(awk '/MemTotal/{print int($4/1024)}' /sys/devices/system/node/node0/meminfo 2>/dev/null)
+  echo "sizing: -g <gridpoints>, footprint MB ~= g/2   (node0 = ${n0mb:-?} MB)"
+  echo "        -g 46000 -> ~22.4 GiB total, ~915 MB hot"
+  echo "        -G hash drops the index grid -> flat access distribution (control)"
+  echo "note:   'INVALID CHECKSUM' is expected off default -g/-p, not a build fault"
+else
+  warn "no $XSBENCH_DIR/openmp-threading/XSBench"
+fi
+
 step "dlrm + pytorch venv"
 # The venv lives in the shared home alongside gapbs/ycsb, so it is built once
 # and every node imports the same torch. It is ~2 GB, hence the build lock.
@@ -378,6 +406,7 @@ printf '%-28s %s\n' \
   "ycsb"          "$([[ -x $YCSB_DIR/bin/ycsb.sh ]] && echo ok || echo MISSING)" \
   "db_bench"      "$([[ -x $ROCKSDB_DIR/db_bench ]] && echo ok || echo MISSING)" \
   "db dataset dir" "$DB_DIR ($DB_FSTYPE)" \
+  "xsbench"       "$([[ -x $XSBENCH_DIR/openmp-threading/XSBench ]] && echo ok || echo MISSING)" \
   "dlrm"          "$([[ -f $DLRM_DIR/dlrm_s_pytorch.py ]] && echo ok || echo MISSING)" \
   "dlrm venv"     "$([[ -x $DLRM_VENV/bin/python ]] && echo ok || echo MISSING)" \
   "dlrm profiler patch" "$(grep -q 'use_cuda=use_gpu' "$DLRM_DIR/dlrm_s_pytorch.py" 2>/dev/null && echo "NOT APPLIED" || echo applied)"
@@ -397,6 +426,8 @@ Next:
   ./run-bench-variant.sh redis hist 1 5
   ./run-bench-variant.sh pr hist 1 5
   ./run-bench-variant.sh dlrm hist 1 5
+  XS_BIN=$XSBENCH_DIR/openmp-threading/XSBench \\
+  ./run-bench-variant.sh xsbench hist 1 5
 
 After a reboot only the runtime state is lost:
   ACTIVATE_ONLY=1 ./tiers_setup.sh
