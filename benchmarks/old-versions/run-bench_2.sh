@@ -9,10 +9,6 @@
 #   e.g.  ./run-bench-variant.sh pr histogram 1 10
 # Run from the directory holding your app scripts and ./gapbs.
 #
-# Between every rep: zone_reclaim_mode, swapoff -a, sync, drop_caches=3.
-#   ZONE_RECLAIM_MODE=0|1   (default 1)  - a run CONDITION, see the guard below
-#   SYNC_MODE=targeted|full|none (default targeted) - full = bare global sync
-#
 # For bfs_cc, generate the graph ONCE first (not per rep):
 #   mkdir -p ~/graphs && ./gapbs/converter -u 27 -k 20 -b ~/graphs/u27k20.sg
 set -uo pipefail
@@ -117,17 +113,6 @@ MEM_TOTAL_GB=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo)
 # targeted | full | none. Default avoids touching NFS mounts entirely.
 SYNC_MODE="${SYNC_MODE:-targeted}"
 SYNC_PATH="${SYNC_PATH:-/}"
-
-# vm.zone_reclaim_mode. 1 = RECLAIM_ZONE only: when node 0 is under its
-# watermark, a blocking allocation first reclaims UNMAPPED page cache/slab on
-# node 0 before falling back to node 1. may_unmap stays 0, so mapped app
-# memory is never touched; with demotion on, that cache is demoted to node 1
-# rather than dropped (counted in pgdemote_direct). Promotion allocations
-# cannot block, so the promotion path itself is unaffected.
-# Changes where an app's memory STARTS -> it is a run condition, not hygiene.
-ZONE_RECLAIM_MODE="${ZONE_RECLAIM_MODE:-1}"
-[[ "$ZONE_RECLAIM_MODE" =~ ^[0-7]$ ]] \
-  || { echo "ERROR: ZONE_RECLAIM_MODE='$ZONE_RECLAIM_MODE' - expected 0..7" >&2; exit 1; }
 
 # free memory on a NUMA node, in MB
 node_free_mb() {
@@ -310,25 +295,6 @@ if [[ ! -w "$OUTDIR" ]]; then
 fi
 
 CSV="$OUTDIR/summary.csv"
-
-# summary.csv has no column for zone_reclaim_mode, so reps run with different
-# values would become indistinguishable once they share a file. The stamp
-# records the value per result dir. A dir that already has results but no
-# stamp predates this setting: its value was never logged, so it is treated
-# as unknown and refused rather than silently assumed to be 0.
-ZRM_STAMP="$OUTDIR/zone_reclaim_mode"
-if [[ -f "$CSV" ]]; then
-  prev_zrm=$(cat "$ZRM_STAMP" 2>/dev/null || echo "unrecorded")
-  if [[ "$prev_zrm" != "$ZONE_RECLAIM_MODE" ]]; then
-    echo "ERROR: $OUTDIR already holds reps with zone_reclaim_mode=$prev_zrm;" >&2
-    echo "       this run would use $ZONE_RECLAIM_MODE. They must not share a summary.csv." >&2
-    echo "       Move the old dir out of results/ (e.g. into results_pre_zrm/)," >&2
-    echo "       or run under a new variant label." >&2
-    exit 1
-  fi
-fi
-echo "$ZONE_RECLAIM_MODE" > "$ZRM_STAMP"
-
 # NOTE: header is unchanged on purpose - existing summary.csv files and
 # check_bench.py keep working. New information goes to the rep logs.
 [[ -f "$CSV" ]] || echo "node,app,variant,condition,thp,rep,kernel,avg_trial_time_s,pgpromote_success_delta,numa_pages_migrated_delta,nr_active_file_delta,dTLB_load_miss_pct,cache_miss_pct,pgpromote_candidate_delta,rl_rejected_delta,threshold_ms_end" > "$CSV"
@@ -409,11 +375,6 @@ pct() { awk -v ev="$1" '{ci=0;pi=0;for(i=1;i<=NF;i++){if($i==ev)ci=i-1;if($i=="#
       echo "      Control case; it should NOT produce a stable histogram peak."
     fi
   fi
-  echo "--- zone reclaim ---"
-  sudo sh -c "echo $ZONE_RECLAIM_MODE > /proc/sys/vm/zone_reclaim_mode"
-  echo -n "zone_reclaim_mode  = "; cat /proc/sys/vm/zone_reclaim_mode
-  # node reclaim only runs while a node's unmapped page cache exceeds this % of it
-  echo -n "min_unmapped_ratio = "; cat /proc/sys/vm/min_unmapped_ratio
   echo "--- swap ---"
   sudo swapoff -a
   swapon --show || true
@@ -455,21 +416,6 @@ for rep in $(seq 1 "$REPS"); do
         sleep 2
       done
       echo "MemAvailable = ${avail_gb:-?} GB of ${MEM_TOTAL_GB} GB"
-      echo "--- between-rep reset: zone_reclaim_mode + swapoff ---"
-      # Both were already set in setup and nothing in a rep changes them, so
-      # this is idempotent. Re-asserting per rep makes each rep log show the
-      # state that rep actually ran in, instead of relying on setup.log.
-      sudo sh -c "echo $ZONE_RECLAIM_MODE > /proc/sys/vm/zone_reclaim_mode"
-      zrm_now=$(cat /proc/sys/vm/zone_reclaim_mode)
-      echo "zone_reclaim_mode = $zrm_now"
-      [[ "$zrm_now" == "$ZONE_RECLAIM_MODE" ]] \
-        || echo "WARNING: zone_reclaim_mode is $zrm_now, wanted $ZONE_RECLAIM_MODE"
-      sudo swapoff -a
-      if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
-        echo "WARNING: swap is still active:"; swapon --show
-      else
-        echo "swap = off"
-      fi
       echo "--- sync + drop caches (mode: $SYNC_MODE) ---"
       # A bare `sync` syncs EVERY mounted filesystem, including NFS. A task
       # blocked in NFS writeback sits in uninterruptible D state, where
@@ -504,16 +450,12 @@ for rep in $(seq 1 "$REPS"); do
     prom0=$(counter pgpromote_success); migr0=$(counter numa_pages_migrated); file0=$(counter nr_active_file)
     cand0=$(counter pgpromote_candidate)
     dem0=$(( $(counter pgdemote_kswapd) + $(counter pgdemote_direct) ))
-    # node reclaim: did zone_reclaim_mode actually fire, and how much it demoted
-    zrs0=$(counter zone_reclaim_success); zrf0=$(counter zone_reclaim_failed)
-    ddir0=$(counter pgdemote_direct)
     rej0=$(hist_val rl_rejected)
     for k in "${ZONE_KEYS[@]}"; do declare "z0_$k=$(hist_val "$k")"; done
     {
       echo "--- vmstat BEFORE ---"
       echo "numa_pages_migrated $migr0"; echo "pgpromote_success $prom0"; echo "nr_active_file $file0"
       echo "pgpromote_candidate $cand0"; echo "pgdemote_total $dem0"; echo "rl_rejected $rej0"
-      echo "zone_reclaim_success $zrs0"; echo "zone_reclaim_failed $zrf0"; echo "pgdemote_direct $ddir0"
       echo "--- BENCHMARK ---"
     } 2>&1 | tee -a "$log"
 
@@ -633,8 +575,6 @@ for rep in $(seq 1 "$REPS"); do
     prom1=$(counter pgpromote_success); migr1=$(counter numa_pages_migrated); file1=$(counter nr_active_file)
     cand1=$(counter pgpromote_candidate)
     dem1=$(( $(counter pgdemote_kswapd) + $(counter pgdemote_direct) ))
-    zrs1=$(counter zone_reclaim_success); zrf1=$(counter zone_reclaim_failed)
-    ddir1=$(counter pgdemote_direct)
     rej1=$(hist_val rl_rejected)
     th_end=$(hist_val threshold_ms)
     zones_on=$(hist_val zones)
@@ -658,7 +598,6 @@ for rep in $(seq 1 "$REPS"); do
       echo "numa_pages_migrated $migr1"; echo "pgpromote_success $prom1"; echo "nr_active_file $file1"
       echo "pgpromote_candidate $cand1"; echo "pgdemote_total $dem1"
       echo "rl_rejected $rej1"; echo "threshold_ms $th_end"
-      echo "zone_reclaim_success $zrs1"; echo "zone_reclaim_failed $zrf1"; echo "pgdemote_direct $ddir1"
       echo "--- DELTAS ---"
       echo "pgpromote_success_delta   = $((prom1-prom0))"
       echo "numa_pages_migrated_delta = $((migr1-migr0))"
@@ -666,9 +605,6 @@ for rep in $(seq 1 "$REPS"); do
       echo "pgpromote_candidate_delta = $((cand1-cand0))"
       echo "pgdemote_total_delta      = $((dem1-dem0))"
       echo "rl_rejected_delta         = $rej_delta"
-      echo "zone_reclaim_success_delta = $((zrs1-zrs0))"
-      echo "zone_reclaim_failed_delta  = $((zrf1-zrf0))"
-      echo "pgdemote_direct_delta      = $((ddir1-ddir0))"
       if [[ "$zones_on" == "1" ]]; then
         echo "--- three-zone policy ---"
         echo "zone1_ms = $z1_end   zone2_ms = $z2_end   peak_bucket = $peak_end"
