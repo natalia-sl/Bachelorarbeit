@@ -10,8 +10,7 @@
 #
 # Usage:
 #   ./tiers_setup.sh              # activate + install whatever is missing
-#   ACTIVATE_ONLY=1 ./tiers_setup.sh   # after a reboot; installs nothing except
-#                                      # missing dlrm python deps (see PART A)
+#   ACTIVATE_ONLY=1 ./tiers_setup.sh   # after a reboot, nothing to install
 #   FORCE_BUILD=1 ./tiers_setup.sh     # rebuild even if binaries exist
 #
 # NOTE ON THE SHARED HOME: $HOME is an NFS export mounted on every node, so
@@ -58,13 +57,7 @@ release_locks() {
 trap release_locks EXIT INT TERM
 
 with_build_lock() {
-  local lock="$1.buildlock" waited=0 l
-  # Re-entrant: a lock THIS run already holds is not another node. Without this,
-  # the dlrm dep top-up in PART A would take the venv lock and the venv block in
-  # PART B would then wait an hour on itself under FORCE_BUILD=1.
-  for l in ${HELD_LOCKS+"${HELD_LOCKS[@]}"}; do
-    [[ "$l" == "$lock" ]] && return 0
-  done
+  local lock="$1.buildlock" waited=0
   while ! mkdir "$lock" 2>/dev/null; do
     if [[ $waited -eq 0 ]]; then
       echo "another node is building $(basename "$1") - waiting"
@@ -78,92 +71,6 @@ with_build_lock() {
   done
   HELD_LOCKS+=("$lock")
   return 0
-}
-
-# DLRM python deps as "<import name>:<pip name>".
-#
-# required - imported at module scope by dlrm_s_pytorch.py or by something it
-#            imports, so a missing one kills the run before argument parsing.
-# optional - imported inside try/except: dlrm prints "Unable to import ..." and
-#            carries on. onnx is only used by --save-onnx and mlperf_logging only
-#            by --mlperf-logging; app_dlrm.sh passes neither, so installing these
-#            silences two warning lines and changes nothing about the run.
-DLRM_PYDEPS_REQUIRED="tqdm:tqdm sklearn.metrics:scikit-learn torch.utils.tensorboard:tensorboard"
-DLRM_PYDEPS_OPTIONAL="mlperf_logging:mlperf-logging onnx:onnx"
-DLRM_PYDEPS_CHECKED=0
-
-# prints the pip names of every listed module that fails to import
-dlrm_missing_pydeps() {
-  "$DLRM_VENV/bin/python" - "$@" 2>/dev/null <<'PY'
-import importlib, sys
-missing = []
-for spec in sys.argv[1:]:
-    mod, pkg = spec.split(":")
-    try:
-        importlib.import_module(mod)
-    except Exception:          # not just ImportError: a numpy ABI clash raises others
-        missing.append(pkg)
-print(" ".join(missing))
-PY
-}
-
-# Check-then-install, so it is cheap when nothing is missing and safe to call on
-# every run. The PART B venv block skips wholesale once the venv exists, which
-# means a package added to its pip line never reaches an existing venv - this
-# is what does.
-ensure_dlrm_pydeps() {
-  [[ "$DLRM_PYDEPS_CHECKED" == "1" ]] && return 0
-  if [[ ! -x "$DLRM_VENV/bin/python" ]]; then
-    echo "no venv at $DLRM_VENV yet - the PART B install creates it"
-    return 0
-  fi
-  DLRM_PYDEPS_CHECKED=1
-  # A broken torch would make torch.utils.tensorboard fail too and get
-  # misreported as "tensorboard missing". It needs a rebuild, not a top-up.
-  if ! "$DLRM_VENV/bin/python" -c 'import torch' 2>/dev/null; then
-    warn "torch does not import in $DLRM_VENV - rebuild with FORCE_BUILD=1"
-    return 1
-  fi
-  local req opt npv
-  req=$(dlrm_missing_pydeps $DLRM_PYDEPS_REQUIRED)
-  opt=$(dlrm_missing_pydeps $DLRM_PYDEPS_OPTIONAL)
-  if [[ -z "$req$opt" ]]; then
-    echo "all dlrm python deps importable"
-    return 0
-  fi
-  [[ -n "$req" ]] && echo "missing (required): $req"
-  [[ -n "$opt" ]] && echo "missing (optional): $opt"
-  with_build_lock "$DLRM_VENV" || return 1
-
-  # "numpy<2" is repeated in BOTH commands on purpose. onnx needs ml_dtypes, and
-  # the current ml_dtypes requires numpy>=2; without the pin in the same command
-  # pip satisfies onnx by upgrading numpy, and torch then fails at import.
-  # Two separate installs so an optional package that has no wheel for this
-  # python cannot take the required ones down with it.
-  if [[ -n "$req" ]]; then
-    "$DLRM_VENV/bin/pip" install --no-cache-dir "numpy<2" $req \
-      || warn "required dlrm dep install failed: $req"
-  fi
-  if [[ -n "$opt" ]]; then
-    "$DLRM_VENV/bin/pip" install --no-cache-dir "numpy<2" $opt \
-      || echo "note: optional dep install failed ($opt) - dlrm runs without them"
-  fi
-
-  # Re-check the required set AFTER both installs: onnx also moves protobuf up a
-  # major version, and tensorboard is the package that would notice.
-  req=$(dlrm_missing_pydeps $DLRM_PYDEPS_REQUIRED)
-  if [[ -n "$req" ]]; then
-    warn "not importable after install: $req"
-  else
-    echo "required dlrm deps importable"
-  fi
-  opt=$(dlrm_missing_pydeps $DLRM_PYDEPS_OPTIONAL)
-  [[ -n "$opt" ]] && echo "optional still missing: $opt (harmless)"
-  npv=$("$DLRM_VENV/bin/python" -c 'import numpy; print(numpy.__version__)' 2>/dev/null)
-  echo "numpy ${npv:-?}"
-  if [[ -n "$npv" && "${npv%%.*}" -ge 2 ]]; then
-    warn "numpy $npv in $DLRM_VENV - torch needs numpy<2 here: $DLRM_VENV/bin/pip install 'numpy<2'"
-  fi
 }
 
 ########################################################################
@@ -240,12 +147,6 @@ if sudo test -r /sys/kernel/debug/nbp_hist; then
 else
   echo "nbp_hist absent - fine for the stock/th0 kernels"
 fi
-
-# Not runtime state, but it lives here so ACTIVATE_ONLY=1 covers it too: the
-# venv is on the shared home, so a missing package is a missing package on
-# every node, and finding out in rep 1 costs a whole preflight cycle.
-step "dlrm python deps"
-ensure_dlrm_pydeps
 
 if [[ "$ACTIVATE_ONLY" == "1" ]]; then
   step "ACTIVATE_ONLY=1 - skipping installs"
@@ -419,9 +320,6 @@ else
       || warn "dlrm python deps install failed"
   fi
 fi
-# No-op if PART A already checked. Does the work on a fresh node, where the
-# venv did not exist yet when PART A ran.
-ensure_dlrm_pydeps
 # DLRM's last commit predates torch 2.x. torch.autograd.profiler.profile() no
 # longer accepts use_cuda=, so the unconditional `with` around the whole training
 # loop raises TypeError before the first iteration. The block is entered with
