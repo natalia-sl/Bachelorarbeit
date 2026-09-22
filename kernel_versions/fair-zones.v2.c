@@ -1893,6 +1893,7 @@ static bool numa_promotion_rate_limit(struct pglist_data *pgdat,
 	return false;
 }
 
+#if 0	/* suspended original threshold adjustment */
 #define NUMA_MIGRATION_ADJUST_STEPS	16
 
 static void numa_promotion_adjust_threshold(struct pglist_data *pgdat,
@@ -1921,30 +1922,29 @@ static void numa_promotion_adjust_threshold(struct pglist_data *pgdat,
 		pgdat->nbp_threshold = th;
 	}
 }
+#endif
 
 /*
  * NBP histogram: self-tuning promotion threshold from hint-fault latency.
  */
 #define NBP_HIST_BUCKETS	10
 #define NBP_BUCKET_MS		(NBP_PRUNE_MS / NBP_HIST_BUCKETS)
-#define NBP_TARGET_PCT		10	/* always promote hottest ~10% */
+#define NBP_TARGET_PCT		10	/* promote hottest ~10% of faults */
 
 static unsigned int nbp_hist[NBP_HIST_BUCKETS];
 static unsigned int nbp_hist_start;	/* decay epoch timestamp */
 static unsigned int nbp_hist_th_start;	/* threshold recompute timestamp */
 /*
- * Published percentile threshold. The adaptive-bounds policy uses it as
- * always_ms: latency < threshold is always promoted.
+ * Published promotion threshold: promote iff latency < threshold.
  *
- * The cold-start value is 0, i.e. "no threshold computed yet". UINT_MAX
- * would mean the opposite -- no ms-valued latency is ever >= UINT_MAX, so
- * EVERYTHING would land in the always zone, saturating the fast tier
- * before any threshold exists. Starting at 0 is safe: nbp_if_free_ms is 0
- * at the same time, so the fault path takes the warm-up fallback (plain
- * capacity test) until the first recompute publishes both, and the
- * histogram insert happens before that test so data still accumulates.
- * nbp_hist_update_threshold() clamps its result to >= 1, so 0 is an
- * unambiguous "no threshold computed yet" sentinel.
+ * The cold-start value is 0, i.e. "promote nothing until the histogram has
+ * data". UINT_MAX would mean the opposite -- no ms-valued latency is ever
+ * >= UINT_MAX, so it promotes EVERYTHING, saturating the fast tier before
+ * any threshold exists. Starting at 0 is safe and self-correcting: the
+ * histogram insert happens before this check so data still accumulates,
+ * and pgdat_free_space_enough() still short-circuits while the fast tier
+ * has room. nbp_hist_update_threshold() clamps its result to >= 1, so 0 is
+ * an unambiguous "no threshold computed yet" sentinel.
  */
 static unsigned int nbp_hist_threshold_ms;
 static unsigned long nbp_rl_rejected;	/* pages the rate limiter blocked */
@@ -1960,20 +1960,18 @@ static unsigned long nbp_pruned;	/* faults discarded: latency >= cutoff */
 static unsigned int nbp_prune = 1;	/* runtime switch: 0 disables pruning */
 
 /*
- * Bucket geometry, switchable at runtime via /sys/kernel/debug/nbp_geometry
+ * Bucket spacing, switchable at runtime via /sys/kernel/debug/nbp_spacing
  * (writing the knob resets histogram, threshold and counters):
  *   1 = static, 10 x 100 ms over [0, 1000)          (pairs with pruning)
  *   2 = log2, 10 buckets, edges 1,2,4,...,256 ms    (comparison)
  *   3 = static power law, lower(b) = (b/10)^n * 1000 (n via nbp_pow_n)
- *   4 = online equal-population, edges rebalanced each epoch (see below)
- * All geometries use NBP_HIST_BUCKETS (10) buckets.
  */
-static unsigned int nbp_geometry = 1;
+static unsigned int nbp_spacing = 1;
 
 /*
- * Geometry 3: static power-law boundaries, lower(b) = (b/10)^n * 1000,
+ * Spacing 3: static power-law boundaries, lower(b) = (b/10)^n * 1000,
  * rounded to the nearest ms. The range closes exactly at NBP_PRUNE_MS, so
- * no bucket is spent on the pruned cold tail. n = 1 degenerates to geometry
+ * no bucket is spent on the pruned cold tail. n = 1 degenerates to spacing
  * 1 (10 x 100 ms); n > 1 concentrates resolution at the hot end, which is
  * where the target decile lives. n is selected at runtime rather than
  * compiled in so the sweep needs no kernel rebuild.
@@ -1987,22 +1985,10 @@ static const unsigned short nbp_pow_lower[NBP_POW_VARIANTS][NBP_HIST_BUCKETS] = 
 	/* n = 2.0 */ { 0, 10, 40,  90, 160, 250, 360, 490, 640, 810 },
 	/* n = 3.0 */ { 0,  1,  8,  27,  64, 125, 216, 343, 512, 729 },
 };
-static const char *const nbp_pow_name[NBP_POW_VARIANTS] = { "2.0", "3.0" };
+static unsigned int nbp_pow_n = 1;	/* index: 1=2.0 2=3.0 */
 
 /*
- * The knob is 1-based: 1 = n 2.0 (default), 2 = n 3.0. The table is
- * 0-based, so every lookup goes through nbp_pow_row(). The setter accepts
- * only [1, NBP_POW_VARIANTS], so the row index is always in bounds.
- */
-static unsigned int nbp_pow_n = 1;
-
-static const unsigned short *nbp_pow_row(void)
-{
-	return nbp_pow_lower[READ_ONCE(nbp_pow_n) - 1];
-}
-
-/*
- * Geometry 4: online equal-population bucketing.
+ * Spacing 4: online equal-population bucketing.
  *
  * Every static geometry is a guess about where the mass will be. This one
  * measures instead: at each epoch flush the boundaries are recomputed so
@@ -2028,19 +2014,19 @@ static const unsigned short *nbp_pow_row(void)
  * publishes it with a single WRITE_ONCE. No locks on the fault path.
  */
 /*
- * Adaptive-bounds promotion policy (nbp_adaptive_bounds = 1).
+ * Three-zone promotion policy (nbp_zones = 1).
  *
- * Instead of one threshold splitting promote/reject, two adaptive bounds
- * cut the latency axis into three zones:
+ * Instead of one threshold splitting promote/reject, the latency axis is
+ * cut into three:
  *
- *   always    latency <  always_ms    always promote
- *   if_free   latency <  if_free_ms   promote only if the fast tier has room
- *   never     otherwise               never promote
+ *   case 1   latency <  zone1   always promote
+ *   case 2   latency <  zone2   promote only if the fast tier has room
+ *   case 3   otherwise          never promote
  *
- * always_ms is the percentile threshold nbp_hist_threshold_ms (the hottest
- * NBP_TARGET_PCT of retained faults). if_free_ms is the UPPER EDGE OF THE
- * PEAK BUCKET: past the bulk of the distribution we are in the cold tail,
- * so promotion stops being worth a migration.
+ * zone1 is the existing percentile threshold (the hottest NBP_TARGET_PCT
+ * of retained faults). zone2 is the UPPER EDGE OF THE PEAK BUCKET: past
+ * the bulk of the distribution we are in the cold tail, so promotion stops
+ * being worth a migration.
  *
  * Why this is worth having: the measured threshold is volatile (stdev 189
  * ms against a median of 113 ms, and 46% of samples put it inside bucket 0
@@ -2049,11 +2035,11 @@ static const unsigned short *nbp_pow_row(void)
  * it only decides the top slice; the middle is decided by the mode -- an
  * interpolation-free statistic -- and by actual free memory.
  *
- * PEAK BY DENSITY, NOT BY COUNT. With equal-width buckets (geometry 1) the
- * two agree, but under geometry 3 and 4 the widths differ by an order of
+ * PEAK BY DENSITY, NOT BY COUNT. With equal-width buckets (spacing 1) the
+ * two agree, but under spacing 3 and 4 the widths differ by an order of
  * magnitude and raw counts would put the peak in whichever bucket is
  * widest. density(b) = count(b) / width(b) is the correct generalisation.
- * It also rescues the scheme under geometry 4, where equal-population
+ * It also rescues the scheme under spacing 4, where equal-population
  * bucketing makes every count equal and the count-mode is undefined --
  * there the densest bucket is simply the narrowest one, which is exactly
  * where the distribution is concentrated.
@@ -2061,31 +2047,38 @@ static const unsigned short *nbp_pow_row(void)
  * Compared as count[a] * width[b] vs count[b] * width[a] to stay in
  * integers. Bounded by ~2e5 * 1e3 * 5, so unsigned long is ample.
  */
-static unsigned int nbp_adaptive_bounds;	/* 0 = stock servo (default) */
-static unsigned int nbp_if_free_ms;	/* upper edge of the peak bucket */
+static unsigned int nbp_zones;		/* 0 = single threshold (default) */
+static unsigned int nbp_zone2_ms;	/* upper edge of the peak bucket */
 static unsigned int nbp_peak_bucket;	/* hysteresis state */
 #define NBP_PEAK_HYST_NUM 5		/* challenger must beat incumbent */
 #define NBP_PEAK_HYST_DEN 4		/* by 5/4 to take over as peak */
 
 /*
- * Per-zone fault counters. Plain unsigned long, non-atomic: these are
+ * Per-case fault counters. Plain unsigned long, non-atomic: these are
  * sampled statistics that tolerate drift, same rationale as the histogram
  * buckets. Exposed in the nbp_hist dump as "key = value" so the benchmark
  * harness can read them with its existing hist_val() helper and take
  * per-run deltas.
  */
-static unsigned long nbp_always;	/* promoted unconditionally */
-static unsigned long nbp_if_free_ok;	/* if_free, tier had room, promoted */
-static unsigned long nbp_if_free_no;	/* if_free, tier full, rejected */
-static unsigned long nbp_never;		/* rejected: past the peak */
-static unsigned long nbp_warmup;	/* pre-first-recompute fallback */
+static unsigned long nbp_case1;		/* promoted unconditionally */
+static unsigned long nbp_case2_ok;	/* case 2, tier had room, promoted */
+static unsigned long nbp_case2_no;	/* case 2, tier full, rejected */
+static unsigned long nbp_case3;		/* rejected: past the peak */
+static unsigned long nbp_case_warm;	/* pre-first-recompute fallback */
 
 static unsigned short nbp_edges[2][NBP_HIST_BUCKETS];
 static unsigned int nbp_edges_idx;	/* which buffer is live */
+static unsigned int nbp_nbuckets = 10;	/* bucket count for spacing 4 */
 static unsigned int nbp_rebal_k = 4;	/* EWMA damping: new = (old*(k-1)+est)/k */
 static unsigned long nbp_rebals;	/* rebalances actually applied */
 static unsigned long nbp_rebal_skips;	/* skipped: too few samples */
 #define NBP_REBAL_MIN_PER_BUCKET 50	/* need this many samples/bucket to trust */
+
+static unsigned int nbp_hist_nbuckets(void)
+{
+	return nbp_spacing == 4 ? nbp_nbuckets : NBP_HIST_BUCKETS;
+	}
+}
 
 /*
  * Epoch policy, switchable via /sys/kernel/debug/nbp_epoch:
@@ -2150,14 +2143,14 @@ static atomic_t nbp_faults = ATOMIC_INIT(0);
 static unsigned int nbp_access_th_mark;	/* odometer at last recompute */
 static unsigned int nbp_access_ep_mark;	/* odometer at last flush */
 
-/* map a latency (ms) to a bucket under the active geometry */
+/* map a latency (ms) to a bucket under the active spacing mode */
 static unsigned int nbp_hist_bucket(unsigned int latency)
 {
-	switch (nbp_geometry) {
+	switch (nbp_spacing) {
 		case 2:				/* log2: 0,1,2,4,...,256+, tail in 9 */
 			return min((unsigned int)fls(latency), NBP_HIST_BUCKETS - 1u);
 		case 3: {			/* static power law, (b/10)^n * 1000 */
-			const unsigned short *lo = nbp_pow_row();
+			const unsigned short *lo = nbp_pow_lower[nbp_pow_n];
 			unsigned int b;
 
 			for (b = 1; b < NBP_HIST_BUCKETS; b++)
@@ -2167,44 +2160,44 @@ static unsigned int nbp_hist_bucket(unsigned int latency)
 		}
 		case 4: {			/* adaptive equal-population */
 			const unsigned short *e = nbp_edges[READ_ONCE(nbp_edges_idx)];
-			unsigned int b;
+			unsigned int n = nbp_nbuckets, b;
 
-			for (b = 1; b < NBP_HIST_BUCKETS; b++)
+			for (b = 1; b < n; b++)
 				if (latency < e[b])
 					return b - 1;
-			return NBP_HIST_BUCKETS - 1;
+			return n - 1;
 		}
 	}
-	/* geometry 1: static 10 x 100 ms */
 	return min(latency / NBP_BUCKET_MS, NBP_HIST_BUCKETS - 1u);
 }
 
 /* inclusive lower latency bound (ms) of bucket b -- inverse of the above */
 static unsigned int nbp_hist_bucket_lower(int b)
 {
-	switch (nbp_geometry) {
+	switch (nbp_spacing) {
 		case 2:
 			return b ? 1u << (b - 1) : 0;
 		case 3:
-			return nbp_pow_row()[b];
+			return nbp_pow_lower[nbp_pow_n][b];
 		case 4:
 			return nbp_edges[READ_ONCE(nbp_edges_idx)][b];
 	}
-	return b * NBP_BUCKET_MS;	/* geometry 1: 10 x 100 ms */
+	return b * NBP_BUCKET_MS;
+	}
 }
 
 /* width (ms) of bucket b (the last bucket's width closes the range) */
 static unsigned int nbp_hist_bucket_width(int b)
 {
-	switch (nbp_geometry) {
+	switch (nbp_spacing) {
 		case 2:
 			if (b == 0)
 				return 1;
-			if (b == NBP_HIST_BUCKETS - 1)
-				return NBP_PRUNE_MS - (1u << (NBP_HIST_BUCKETS - 2));
-			return 1u << (b - 1);
+		if (b == NBP_HIST_BUCKETS - 1)
+			return NBP_PRUNE_MS - (1u << (NBP_HIST_BUCKETS - 2));
+		return 1u << (b - 1);
 		case 3: {
-			const unsigned short *lo = nbp_pow_row();
+			const unsigned short *lo = nbp_pow_lower[nbp_pow_n];
 
 			/* the range closes at the prune cutoff by construction */
 			return (b == NBP_HIST_BUCKETS - 1 ?
@@ -2212,12 +2205,12 @@ static unsigned int nbp_hist_bucket_width(int b)
 		}
 		case 4: {
 			const unsigned short *e = nbp_edges[READ_ONCE(nbp_edges_idx)];
+			unsigned int n = nbp_nbuckets;
 
-			return (b == NBP_HIST_BUCKETS - 1 ?
-				NBP_PRUNE_MS : e[b + 1]) - e[b];
+			return (b + 1 >= n ? NBP_PRUNE_MS : e[b + 1]) - e[b];
 		}
 	}
-	return NBP_BUCKET_MS;		/* geometry 1 */
+	return NBP_BUCKET_MS;
 }
 
 /*
@@ -2229,6 +2222,7 @@ static void nbp_hist_update_threshold(void)
 {
 	unsigned int snap[NBP_HIST_BUCKETS];
 	unsigned long total = 0, acc = 0, budget, need;
+	unsigned int n = nbp_hist_nbuckets();
 	unsigned int th_ms;
 	int b;
 
@@ -2255,7 +2249,7 @@ static void nbp_hist_update_threshold(void)
 	 * the whole class of torn reads rather than patching the one
 	 * divisor.
 	 */
-	for (b = 0; b < NBP_HIST_BUCKETS; b++) {
+	for (b = 0; b < n; b++) {
 		snap[b] = READ_ONCE(nbp_hist[b]);
 		total += snap[b];
 	}
@@ -2266,12 +2260,12 @@ static void nbp_hist_update_threshold(void)
 	if (!budget)
 		budget = 1;
 
-	for (b = 0; b < NBP_HIST_BUCKETS; b++) {
+	for (b = 0; b < n; b++) {
 		if (acc + snap[b] >= budget)
 			break;
 		acc += snap[b];
 	}
-	if (b >= NBP_HIST_BUCKETS) {
+	if (b >= n) {
 		WRITE_ONCE(nbp_hist_threshold_ms, 0);
 		return;
 	}
@@ -2293,28 +2287,28 @@ static void nbp_hist_update_threshold(void)
 	WRITE_ONCE(nbp_hist_threshold_ms, th_ms);
 
 	/*
-	 * if_free_ms: upper edge of the peak-DENSITY bucket, with hysteresis.
+	 * zone2: upper edge of the peak-DENSITY bucket, with hysteresis.
 	 *
 	 * Hysteresis matters more than it looks. Observed dumps put the peak
 	 * in bucket 0 at one sample and bucket 3 at the next, which would
-	 * swing if_free_ms between 100 ms and 400 ms every epoch. A bare argmax
+	 * swing zone2 between 100 ms and 400 ms every epoch. A bare argmax
 	 * over noisy counts is a coin flip whenever two buckets are close,
 	 * and every flip changes what gets promoted. The incumbent is only
 	 * displaced by a challenger 25% denser.
 	 */
 	{
 		unsigned int peak = READ_ONCE(nbp_peak_bucket);
-		unsigned int wp, if_free_ms;
+		unsigned int wp, z2;
 		unsigned long dp;
 
-		if (peak >= NBP_HIST_BUCKETS)
+		if (peak >= n)
 			peak = 0;
 		wp = nbp_hist_bucket_width(peak);
 		if (!wp)
 			wp = 1;
 		dp = (unsigned long)snap[peak];
 
-		for (b = 0; b < NBP_HIST_BUCKETS; b++) {
+		for (b = 0; b < n; b++) {
 			unsigned int wb = nbp_hist_bucket_width(b);
 
 			if (!wb)
@@ -2329,18 +2323,16 @@ static void nbp_hist_update_threshold(void)
 		}
 		WRITE_ONCE(nbp_peak_bucket, peak);
 
-		if_free_ms = nbp_hist_bucket_lower(peak) +
-			     nbp_hist_bucket_width(peak);
+		z2 = nbp_hist_bucket_lower(peak) + nbp_hist_bucket_width(peak);
 		/*
 		 * If the hottest NBP_TARGET_PCT already runs past the peak,
-		 * the if_free zone is legitimately empty -- clamp rather
-		 * than invert.
+		 * case 2 is legitimately empty -- clamp rather than invert.
 		 */
-		if (if_free_ms < th_ms)
-			if_free_ms = th_ms;
-		if (if_free_ms > NBP_PRUNE_MS)
-			if_free_ms = NBP_PRUNE_MS;
-		WRITE_ONCE(nbp_if_free_ms, if_free_ms);
+		if (z2 < th_ms)
+			z2 = th_ms;
+		if (z2 > NBP_PRUNE_MS)
+			z2 = NBP_PRUNE_MS;
+		WRITE_ONCE(nbp_zone2_ms, z2);
 	}
 }
 
@@ -2351,7 +2343,7 @@ static void nbp_hist_update_threshold(void)
  * fades over minutes. No new tunables.
  */
 /*
- * Seed the boundaries with the n = 2 power law over the N buckets:
+ * Seed the boundaries with the n = 2 power law scaled to N buckets:
  * edge(k) = (k/N)^2 * NBP_PRUNE_MS. A hot-concentrated starting geometry
  * beats uniform because the first rebalance is estimated from whatever the
  * seed captured, so a seed that already resolves the hot end gives a
@@ -2360,11 +2352,11 @@ static void nbp_hist_update_threshold(void)
  */
 static void nbp_hist_seed_edges(void)
 {
+	unsigned int n = clamp(nbp_nbuckets, 4u, (unsigned int)NBP_HIST_BUCKETS);
 	unsigned int k;
 
-	for (k = 0; k < NBP_HIST_BUCKETS; k++) {
-		unsigned int v = (unsigned int)((k * k * NBP_PRUNE_MS) /
-						(NBP_HIST_BUCKETS * NBP_HIST_BUCKETS));
+	for (k = 0; k < n; k++) {
+		unsigned int v = (unsigned int)((k * k * NBP_PRUNE_MS) / (n * n));
 
 		nbp_edges[0][k] = v;
 		nbp_edges[1][k] = v;
@@ -2378,13 +2370,13 @@ static void nbp_hist_seed_edges(void)
  */
 static void nbp_hist_rebalance(void)
 {
-	const unsigned int n = NBP_HIST_BUCKETS;
+	unsigned int n = nbp_hist_nbuckets();
 	unsigned int cur = READ_ONCE(nbp_edges_idx);
 	unsigned short *dst = nbp_edges[cur ^ 1];
 	const unsigned short *src = nbp_edges[cur];
 	unsigned int snap[NBP_HIST_BUCKETS];
 	unsigned long total = 0;
-	unsigned int b, k, acc = 0;
+	unsigned int b, k, acc = 0, kk;
 	/*
 	 * Read the damping factor ONCE into a validated local. nbp_rebal_k
 	 * is a bare debugfs_create_u32 with no setter, so userspace can
@@ -2456,6 +2448,9 @@ static void nbp_hist_rebalance(void)
 			damped = NBP_PRUNE_MS - n + k;
 		dst[k] = damped;
 	}
+	/* trailing entries kept sane if nbuckets shrank under us */
+	for (kk = n; kk < NBP_HIST_BUCKETS; kk++)
+		dst[kk] = NBP_PRUNE_MS - 1;
 
 	WRITE_ONCE(nbp_edges_idx, cur ^ 1);
 	nbp_rebals++;
@@ -2494,9 +2489,9 @@ static void nbp_hist_maybe_decay(void)
 		mark = READ_ONCE(nbp_access_ep_mark);
 		if (cnt - mark >= nbp_epoch_every &&
 		    cmpxchg(&nbp_access_ep_mark, mark, cnt) == mark) {
-			if (nbp_geometry == 4)
+			if (nbp_spacing == 4)
 				nbp_hist_rebalance();	/* reads, so pre-zero */
-			for (b = 0; b < NBP_HIST_BUCKETS; b++)
+			for (b = 0; b < nbp_hist_nbuckets(); b++)
 				nbp_hist[b] = 0;
 			nbp_flushes++;
 			nbp_epoch_samples = 0;	/* diagnostic only in this mode */
@@ -2521,13 +2516,13 @@ static void nbp_hist_maybe_decay(void)
 	if (now - start > (nbp_epoch ? NBP_EPOCH_MS :
 			   sysctl_numa_balancing_scan_period_max) &&
 	    cmpxchg(&nbp_hist_start, start, now) == start) {
-		const unsigned int n = NBP_HIST_BUCKETS;
+		unsigned int n = nbp_hist_nbuckets();
 
 		if (!nbp_epoch) {		/* control: gradual halving */
 			for (b = 0; b < n; b++)
 				nbp_hist[b] >>= 1;
 		} else if (nbp_epoch_samples >= nbp_epoch_min) {
-			if (nbp_geometry == 4)
+			if (nbp_spacing == 4)
 				nbp_hist_rebalance();	/* before zeroing */
 			for (b = 0; b < n; b++)	/* flush: fresh window */
 				nbp_hist[b] = 0;
@@ -2564,51 +2559,21 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 	if (folio_use_access_time(folio)) {
 		struct pglist_data *pgdat;
 		unsigned long rate_limit;
-		unsigned int latency, always_ms, if_free_ms;
+		unsigned int latency;
 
 		pgdat = NODE_DATA(dst_nid);
-
 		/*
-		 * nbp_adaptive_bounds = 0: the stock 6.16.1 policy, logic
-		 * unchanged -- free-space early return, the rate-limit-driven
-		 * threshold servo, then the rate limiter. The histogram is
-		 * neither fed nor consulted, so this is the in-kernel stock
-		 * baseline rather than a variant of the histogram mechanism.
+		 * In three-zone mode this early return is NOT taken. Upstream
+		 * it short-circuits before the histogram insert, so while the
+		 * fast tier has room every fault is promoted AND no fault is
+		 * recorded -- the histogram sees nothing for the whole fill
+		 * phase and then has to work from a standing start the moment
+		 * the tier fills. Folding the same test into case 2 keeps the
+		 * capacity check but feeds the histogram from the first fault.
 		 */
-		if (!nbp_adaptive_bounds) {
-			unsigned int th, def_th;
+		if (!nbp_zones && pgdat_free_space_enough(pgdat))
+			return true;
 
-			if (pgdat_free_space_enough(pgdat)) {
-				/* workload changed, reset hot threshold */
-				pgdat->nbp_threshold = 0;
-				return true;
-			}
-
-			def_th = sysctl_numa_balancing_hot_threshold;
-			rate_limit = sysctl_numa_balancing_promote_rate_limit <<
-				(20 - PAGE_SHIFT);
-			numa_promotion_adjust_threshold(pgdat, rate_limit,
-							def_th);
-
-			th = pgdat->nbp_threshold ? : def_th;
-			latency = numa_hint_fault_latency(folio);
-			if (latency >= th)
-				return false;
-
-			return !numa_promotion_rate_limit(pgdat, rate_limit,
-							  folio_nr_pages(folio));
-		}
-
-		/*
-		 * Adaptive bounds. The stock free-space early return above is
-		 * NOT taken here: it short-circuits before the histogram
-		 * insert, so while the fast tier has room every fault is
-		 * promoted AND no fault is recorded -- the histogram sees
-		 * nothing for the whole fill phase and then has to work from
-		 * a standing start the moment the tier fills. Folding the same
-		 * test into the if_free zone keeps the capacity check but
-		 * feeds the histogram from the first fault.
-		 */
 		latency = numa_hint_fault_latency(folio);
 
 		/* counted before pruning: pruned faults are still faults */
@@ -2623,30 +2588,35 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 		nbp_epoch_samples++;
 		nbp_hist_maybe_decay();
 
-		always_ms = READ_ONCE(nbp_hist_threshold_ms);
-		if_free_ms = READ_ONCE(nbp_if_free_ms);
+		if (nbp_zones) {
+			unsigned int z1 = READ_ONCE(nbp_hist_threshold_ms);
+			unsigned int z2 = READ_ONCE(nbp_zone2_ms);
 
-		if (!if_free_ms) {
-			/*
-			 * No recompute has landed yet. Fall back to the plain
-			 * capacity test rather than promoting nothing: this is
-			 * the same behaviour as the upstream early return, so
-			 * warm-up is no worse than stock, and it ends as soon
-			 * as the first threshold is published.
-			 */
-			nbp_warmup++;
-			if (!pgdat_free_space_enough(pgdat))
-				return false;
-		} else if (latency < always_ms) {
-			nbp_always++;
-		} else if (latency < if_free_ms) {
-			if (!pgdat_free_space_enough(pgdat)) {
-				nbp_if_free_no++;
+			if (!z2) {
+				/*
+				 * No recompute has landed yet. Fall back to
+				 * the plain capacity test rather than
+				 * promoting nothing: this is the same
+				 * behaviour as the upstream early return, so
+				 * warm-up is no worse than stock, and it ends
+				 * as soon as the first threshold is published.
+				 */
+				nbp_case_warm++;
+				if (!pgdat_free_space_enough(pgdat))
+					return false;
+			} else if (latency < z1) {
+				nbp_case1++;		/* always promote */
+			} else if (latency < z2) {
+				if (!pgdat_free_space_enough(pgdat)) {
+					nbp_case2_no++;
+					return false;
+				}
+				nbp_case2_ok++;
+			} else {
+				nbp_case3++;		/* past the peak */
 				return false;
 			}
-			nbp_if_free_ok++;
-		} else {
-			nbp_never++;		/* past the peak */
+		} else if (latency >= READ_ONCE(nbp_hist_threshold_ms)) {
 			return false;
 		}
 
@@ -14450,14 +14420,12 @@ static int nbp_hist_show(struct seq_file *m, void *v)
 {
 	int b;
 
-	seq_printf(m, "geometry = %u  prune = %u  epoch = %u  epoch_samples = %u\n",
-		   nbp_geometry, nbp_prune, nbp_epoch, nbp_epoch_samples);
-	/* "(n = ...)" keeps traces self-describing; hist_val still reads $3 */
-	seq_printf(m, "pow_n = %u  (n = %s)\n", nbp_pow_n,
-		   nbp_pow_name[nbp_pow_n - 1]);
+	seq_printf(m, "spacing = %u  prune = %u  epoch = %u  epoch_samples = %u\n",
+		   nbp_spacing, nbp_prune, nbp_epoch, nbp_epoch_samples);
+	seq_printf(m, "pow_n = %u\n", nbp_pow_n);
 	seq_printf(m, "access = %u  th_every = %u  epoch_every = %u\n",
 		   nbp_access, nbp_th_every, nbp_epoch_every);
-	for (b = 0; b < NBP_HIST_BUCKETS; b++)
+	for (b = 0; b < nbp_hist_nbuckets(); b++)
 		seq_printf(m, "bucket %2d [%6u ms+): %u\n",
 			   b, nbp_hist_bucket_lower(b), nbp_hist[b]);
 	seq_printf(m, "threshold_ms = %u\n", READ_ONCE(nbp_hist_threshold_ms));
@@ -14474,18 +14442,18 @@ static int nbp_hist_show(struct seq_file *m, void *v)
 	 * One "key = value" per line so the harness hist_val() helper
 	 * (awk '$1==k {print $3}') can pick each of these up directly.
 	 */
-	seq_printf(m, "adaptive_bounds = %u\n", nbp_adaptive_bounds);
-	seq_printf(m, "always_ms = %u\n", READ_ONCE(nbp_hist_threshold_ms));
-	seq_printf(m, "if_free_ms = %u\n", READ_ONCE(nbp_if_free_ms));
+	seq_printf(m, "zones = %u\n", nbp_zones);
+	seq_printf(m, "zone1_ms = %u\n", READ_ONCE(nbp_hist_threshold_ms));
+	seq_printf(m, "zone2_ms = %u\n", READ_ONCE(nbp_zone2_ms));
 	seq_printf(m, "peak_bucket = %u\n", READ_ONCE(nbp_peak_bucket));
-	seq_printf(m, "always = %lu\n", nbp_always);
-	seq_printf(m, "if_free_ok = %lu\n", nbp_if_free_ok);
-	seq_printf(m, "if_free_no = %lu\n", nbp_if_free_no);
-	seq_printf(m, "never = %lu\n", nbp_never);
-	seq_printf(m, "warmup = %lu\n", nbp_warmup);
-	if (nbp_geometry == 4)
-		seq_printf(m, "rebal_k = %u  rebals = %lu  rebal_skips = %lu\n",
-			   nbp_rebal_k, nbp_rebals, nbp_rebal_skips);
+	seq_printf(m, "case1 = %lu\n", nbp_case1);
+	seq_printf(m, "case2_ok = %lu\n", nbp_case2_ok);
+	seq_printf(m, "case2_no = %lu\n", nbp_case2_no);
+	seq_printf(m, "case3 = %lu\n", nbp_case3);
+	seq_printf(m, "case_warm = %lu\n", nbp_case_warm);
+	if (nbp_spacing == 4)
+		seq_printf(m, "nbuckets = %u  rebal_k = %u  rebals = %lu  rebal_skips = %lu\n",
+			   nbp_nbuckets, nbp_rebal_k, nbp_rebals, nbp_rebal_skips);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(nbp_hist);
@@ -14517,35 +14485,52 @@ static void nbp_hist_reset(void)
 	nbp_shifts = 0;
 	nbp_rebals = 0;
 	nbp_rebal_skips = 0;
-	WRITE_ONCE(nbp_if_free_ms, 0);
+	WRITE_ONCE(nbp_zone2_ms, 0);
 	WRITE_ONCE(nbp_peak_bucket, 0);
-	nbp_always = 0;
-	nbp_if_free_ok = 0;
-	nbp_if_free_no = 0;
-	nbp_never = 0;
-	nbp_warmup = 0;
+	nbp_case1 = 0;
+	nbp_case2_ok = 0;
+	nbp_case2_no = 0;
+	nbp_case3 = 0;
+	nbp_case_warm = 0;
 	nbp_hist_seed_edges();
 	atomic_set(&nbp_faults, 0);
 	nbp_access_th_mark = 0;
 	nbp_access_ep_mark = 0;
 }
 
-static int nbp_geometry_get(void *data, u64 *val)
+static int nbp_spacing_get(void *data, u64 *val)
 {
-	*val = nbp_geometry;
+	*val = nbp_spacing;
 	return 0;
 }
 
-static int nbp_geometry_set(void *data, u64 val)
+static int nbp_spacing_set(void *data, u64 val)
 {
 	if (val < 1 || val > 4)
 		return -EINVAL;
-	nbp_geometry = val;
+	nbp_spacing = val;
 	nbp_hist_reset();
 	return 0;
 }
-DEFINE_DEBUGFS_ATTRIBUTE(nbp_geometry_fops, nbp_geometry_get,
-			 nbp_geometry_set, "%llu\n");
+DEFINE_DEBUGFS_ATTRIBUTE(nbp_spacing_fops, nbp_spacing_get,
+			 nbp_spacing_set, "%llu\n");
+
+static int nbp_nbuckets_get(void *data, u64 *val)
+{
+	*val = nbp_nbuckets;
+	return 0;
+}
+
+static int nbp_nbuckets_set(void *data, u64 val)
+{
+	if (val < 4 || val > NBP_HIST_BUCKETS)
+		return -EINVAL;
+	nbp_nbuckets = val;
+	nbp_hist_reset();		/* reseeds the edges */
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(nbp_nbuckets_fops, nbp_nbuckets_get,
+			 nbp_nbuckets_set, "%llu\n");
 
 static int nbp_pow_n_get(void *data, u64 *val)
 {
@@ -14555,7 +14540,7 @@ static int nbp_pow_n_get(void *data, u64 *val)
 
 static int nbp_pow_n_set(void *data, u64 val)
 {
-	if (val < 1 || val > NBP_POW_VARIANTS)
+	if (val >= NBP_POW_VARIANTS)
 		return -EINVAL;
 	nbp_pow_n = val;
 	nbp_hist_reset();
@@ -14567,15 +14552,15 @@ DEFINE_DEBUGFS_ATTRIBUTE(nbp_pow_n_fops, nbp_pow_n_get,
 static int __init nbp_hist_debugfs_init(void)
 {
 	debugfs_create_file("nbp_hist", 0444, NULL, NULL, &nbp_hist_fops);
-	debugfs_create_file("nbp_geometry", 0644, NULL, NULL, &nbp_geometry_fops);
+	debugfs_create_file("nbp_spacing", 0644, NULL, NULL, &nbp_spacing_fops);
 	debugfs_create_file("nbp_pow_n", 0644, NULL, NULL, &nbp_pow_n_fops);
+	debugfs_create_file("nbp_nbuckets", 0644, NULL, NULL, &nbp_nbuckets_fops);
 	debugfs_create_u32("nbp_rebal_k", 0644, NULL, &nbp_rebal_k);
 	nbp_hist_seed_edges();
 	debugfs_create_u32("nbp_prune", 0644, NULL, &nbp_prune);
 	debugfs_create_u32("nbp_epoch", 0644, NULL, &nbp_epoch);
 	debugfs_create_u32("nbp_epoch_min", 0644, NULL, &nbp_epoch_min);
-	debugfs_create_u32("nbp_adaptive_bounds", 0644, NULL,
-			   &nbp_adaptive_bounds);
+	debugfs_create_u32("nbp_zones", 0644, NULL, &nbp_zones);
 	debugfs_create_u32("nbp_access", 0644, NULL, &nbp_access);
 	debugfs_create_u32("nbp_th_every", 0644, NULL, &nbp_th_every);
 	debugfs_create_u32("nbp_epoch_every", 0644, NULL, &nbp_epoch_every);

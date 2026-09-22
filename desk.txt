@@ -1,0 +1,6 @@
+things to change in fair:
+nbp_spacing into nbp_geometry!!
+nbp_zones into smth else
+- remove spacing 0 (bucket sets)
+remove the threshold being 10%, so if zones not turned on old threshold works
+remove n=1,5 and 2,5
