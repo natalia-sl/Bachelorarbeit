@@ -98,6 +98,8 @@ ensure_scratch() {
     elif [[ "$mode" == "create" ]]; then
       if [[ -x /usr/local/etc/emulab/mkextrafs.pl ]]; then
         echo "creating $DB_MOUNT on the free space of $root_disk"
+        # mkextrafs.pl refuses a mountpoint that does not exist yet
+        sudo mkdir -p "$DB_MOUNT"
         sudo /usr/local/etc/emulab/mkextrafs.pl -f "$DB_MOUNT" \
           || { warn "mkextrafs.pl failed - see 'sudo parted $root_disk unit GB print free'"; return 1; }
       else
