@@ -12,7 +12,7 @@ set -euo pipefail
 # Optional: a version suffix so your last working kernel stays bootable
 # as a fallback (recommended). Keep it in sync with the static-th value you
 # built, e.g. "-th0" when you ran make-static-th.sh 0.
-LOCALVERSION="-acc-fix"          # e.g. "-th0"
+LOCALVERSION="-th1000"          # e.g. "-th0"
 cd ~/Natalia_SS2026/Linux-6-16-Tiers/linux-6.16.1
 
 # --- sanity checks -------------------------------------------------------
