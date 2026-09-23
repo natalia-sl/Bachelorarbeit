@@ -1954,6 +1954,7 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 		numa_promotion_adjust_threshold(pgdat, rate_limit, def_th);
 
 		th = 1000;  /* static threshold (th=0) */
+		pr_info_once("nbp: static th=%u ms\n", th);
 		latency = numa_hint_fault_latency(folio);
 		if (latency >= th)
 			return false;

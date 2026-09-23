@@ -106,6 +106,12 @@ hist_val() {
   v=$(sudo awk -v k="$1" '$1==k {print $3}' "$HIST_DBG" 2>/dev/null)
   echo "${v:-NA}"
 }
+#helper for printing th if its static
+static_th_marker() {
+  local m
+  m=$(sudo dmesg 2>/dev/null | grep -o 'nbp: static th=[0-9]* ms' | tail -1)
+  echo "${m:-not printed (path not reached yet, or not a static-th kernel)}"
+}
 # numeric delta of two hist_val readings; NA if either side is missing
 hist_delta() {
   if [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ ]]; then echo $(( $2 - $1 )); else echo NA; fi
@@ -655,6 +661,7 @@ for rep in $(seq 1 "$REPS"); do
 
     {
       echo "--- vmstat AFTER ---"
+      echo -n "kernel_th_marker: "; static_th_marker
       echo "numa_pages_migrated $migr1"; echo "pgpromote_success $prom1"; echo "nr_active_file $file1"
       echo "pgpromote_candidate $cand1"; echo "pgdemote_total $dem1"
       echo "rl_rejected $rej1"; echo "threshold_ms $th_end"
