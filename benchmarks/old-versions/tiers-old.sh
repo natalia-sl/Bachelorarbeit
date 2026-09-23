@@ -6,8 +6,7 @@
 #   ACTIVATE  runtime state that does NOT survive a reboot: tier module,
 #             numa_balancing=2, demotion, THP, swapoff. Run after every boot.
 #   INSTALL   software that DOES survive: gapbs, redis, YCSB, rocksdb/db_bench,
-#             perf, the /mydata scratch filesystem and the RocksDB dataset.
-#             Skipped automatically when already present.
+#             perf. Skipped automatically when already present.
 #
 # Usage:
 #   ./tiers_setup.sh              # activate + install whatever is missing
@@ -38,85 +37,14 @@ DLRM_DIR="$HOME/dlrm"
 DLRM_VENV="$HOME/dlrm-venv"
 XSBENCH_DIR="$HOME/XSBench"
 
-# node-local scratch filesystem for the RocksDB dataset. The CloudLab root
-# partition is ~64 GB and nearly full once three kernels are installed, but the
-# boot SSD has ~400 GB unpartitioned; mkextrafs.pl turns that into /mydata.
-# NEVER the NFS home, NEVER tmpfs, NEVER the rotational sdb.
-DB_MOUNT="${DB_MOUNT:-/mydata}"
-DB_DIR="${DB_DIR:-$DB_MOUNT/db_bench}"
-# Dataset shape - must match what run-bench-variant.sh passes to the app.
-DB_NUM="${DB_NUM:-12000000}"
-DB_KEY_SIZE="${DB_KEY_SIZE:-16}"
-DB_VALUE_SIZE="${DB_VALUE_SIZE:-1024}"
-SKIP_DB_LOAD="${SKIP_DB_LOAD:-0}"
-# RocksDB version the existing results were produced with. A fresh node clones
-# HEAD, so a different version is a warning, not silence. ROCKSDB_REF pins the
-# checkout to a commit or tag (get it on a good node: git -C ~/rocksdb rev-parse HEAD).
-ROCKSDB_EXPECT="${ROCKSDB_EXPECT:-11.11.0}"
-ROCKSDB_REF="${ROCKSDB_REF:-}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DB_APP="${DB_APP:-$SCRIPT_DIR/app_db_bench.sh}"
+# node-local scratch for the RocksDB dataset - NEVER the NFS home
+DB_DIR="${DB_DIR:-/var/tmp/db_bench}"
 # node-local scratch for DLRM's tensorboard event files - NEVER the NFS home
 DLRM_SCRATCH="${DLRM_SCRATCH:-/var/tmp/dlrm}"
 
 WARNINGS=()
 step() { echo; echo "===== $* ====="; }
 warn() { echo "WARNING: $*" >&2; WARNINGS+=("$*"); }
-
-rocksdb_version() {
-  awk '/#define ROCKSDB_MAJOR/{a=$3} /#define ROCKSDB_MINOR/{b=$3} /#define ROCKSDB_PATCH/{c=$3}
-       END{ if (a=="") print "unknown"; else printf "%s.%s.%s\n", a, b, c }' \
-      "$ROCKSDB_DIR/include/rocksdb/version.h" 2>/dev/null || echo unknown
-}
-
-# Mount the node-local scratch filesystem. Order of attempts:
-#   1. already mounted                      -> nothing to do
-#   2. listed in /etc/fstab                 -> mount it
-#   3. exactly one unmounted ext2/3/4 partition on the boot disk
-#      (made on an earlier run, lost on reboot) -> mount it
-#   4. none, and $1 == create               -> mkextrafs.pl on the free space
-# Creating a filesystem is never done under ACTIVATE_ONLY=1.
-ensure_scratch() {
-  local mode="${1:-mount}" root_src root_disk cands n
-  if mountpoint -q "$DB_MOUNT"; then
-    echo "$DB_MOUNT already mounted"
-  elif grep -qs "[[:space:]]$DB_MOUNT[[:space:]]" /etc/fstab && sudo mount "$DB_MOUNT" 2>/dev/null; then
-    echo "$DB_MOUNT mounted from /etc/fstab"
-  else
-    root_src=$(findmnt -no SOURCE /)
-    root_disk="/dev/$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -1)"
-    cands=$(lsblk -nrpo NAME,FSTYPE,MOUNTPOINT "$root_disk" 2>/dev/null \
-              | awk '$2 ~ /^ext[234]$/ && $3 == "" {print $1}')
-    n=$(wc -w <<<"$cands")
-    if [[ "$n" -eq 1 ]]; then
-      sudo mkdir -p "$DB_MOUNT" && sudo mount "$cands" "$DB_MOUNT" \
-        && echo "mounted existing $cands on $DB_MOUNT" \
-        || warn "mount $cands $DB_MOUNT failed"
-    elif [[ "$n" -gt 1 ]]; then
-      warn "several unmounted ext partitions on $root_disk ($cands) - mount the right one on $DB_MOUNT by hand"
-      return 1
-    elif [[ "$mode" == "create" ]]; then
-      if [[ -x /usr/local/etc/emulab/mkextrafs.pl ]]; then
-        echo "creating $DB_MOUNT on the free space of $root_disk"
-        sudo /usr/local/etc/emulab/mkextrafs.pl -f "$DB_MOUNT" \
-          || { warn "mkextrafs.pl failed - see 'sudo parted $root_disk unit GB print free'"; return 1; }
-      else
-        warn "no mkextrafs.pl (not a CloudLab image?) - create and mount $DB_MOUNT by hand"
-        return 1
-      fi
-    else
-      warn "$DB_MOUNT not mounted and no scratch partition found - run without ACTIVATE_ONLY"
-      return 1
-    fi
-  fi
-  mountpoint -q "$DB_MOUNT" || return 1
-  local dev rota
-  dev=$(findmnt -no SOURCE "$DB_MOUNT")
-  rota=$(lsblk -dno ROTA "/dev/$(lsblk -no PKNAME "$dev" | head -1)" 2>/dev/null)
-  [[ "$rota" == "1" ]] && warn "$DB_MOUNT is on a ROTATIONAL disk ($dev) - use the SSD"
-  df -h "$DB_MOUNT" | tail -1
-  return 0
-}
 
 # Atomic-enough mutual exclusion for builds into the shared home. mkdir is the
 # lock: it either creates the directory or it does not, with no race in between.
@@ -254,26 +182,6 @@ fi
 for p in numa_balancing=2; do
   grep -q "$p" /proc/cmdline || echo "note: '$p' not on the cmdline (set below at runtime instead)"
 done
-
-step "root filesystem"
-ROOT_FREE_GB="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
-echo "/ free = ${ROOT_FREE_GB} GB"
-# make modules_install keeps debug info: ~7 GB per kernel. Three kernels were
-# enough to fill the 64 GB root partition on node0.
-for m in /lib/modules/*; do
-  [[ -d "$m" ]] || continue
-  msz=$(sudo du -sBG "$m" 2>/dev/null | cut -f1 | tr -dc '0-9')
-  if [[ "${msz:-0}" -ge 2 ]]; then
-    warn "$m is ${msz} GB (unstripped). Fix: sudo find $m -name '*.ko' -exec strip --strip-debug {} +"
-  fi
-done
-if [[ "${ROOT_FREE_GB:-0}" -lt 5 ]]; then
-  warn "only ${ROOT_FREE_GB} GB free on / - logs and installs will start failing"
-fi
-
-step "node-local scratch disk ($DB_MOUNT)"
-# After a reboot this remounts the partition made on the first run.
-if [[ "$ACTIVATE_ONLY" == "1" ]]; then ensure_scratch mount; else ensure_scratch create; fi
 
 step "tier module"
 if [[ -d "$KDIR" ]]; then
@@ -420,12 +328,6 @@ if [[ -x "$ROCKSDB_DIR/db_bench" && "$FORCE_BUILD" != "1" ]]; then
 else
   if with_build_lock "$ROCKSDB_DIR"; then
     [[ -d "$ROCKSDB_DIR/.git" ]] || git clone --depth 1 https://github.com/facebook/rocksdb.git "$ROCKSDB_DIR"
-    if [[ -n "$ROCKSDB_REF" ]]; then
-      # GitHub serves any commit to a shallow fetch, so a --depth 1 clone can
-      # still be moved to the exact commit the other nodes were built from.
-      ( cd "$ROCKSDB_DIR" && git fetch --depth 1 origin "$ROCKSDB_REF" && git checkout -q FETCH_HEAD ) \
-        || warn "could not check out ROCKSDB_REF=$ROCKSDB_REF"
-    fi
     echo "building db_bench - this takes a while"
     # DEBUG_LEVEL=0 is not optional: the default build ships assertions and
     # runs several times slower, which distorts the hint-fault rate.
@@ -434,46 +336,30 @@ else
   fi
 fi
 [[ -x "$ROCKSDB_DIR/db_bench" ]] || warn "no $ROCKSDB_DIR/db_bench"
-ROCKSDB_HAVE="$(rocksdb_version)"
-echo "rocksdb $ROCKSDB_HAVE (commit $(git -C "$ROCKSDB_DIR" rev-parse --short HEAD 2>/dev/null || echo ?))"
-if [[ "$ROCKSDB_HAVE" != "$ROCKSDB_EXPECT" ]]; then
-  warn "rocksdb $ROCKSDB_HAVE, other results used $ROCKSDB_EXPECT - rebuild with ROCKSDB_REF=<commit> FORCE_BUILD=1, or set ROCKSDB_EXPECT"
-fi
 
-step "db_bench dataset (node-local)"
-DB_FSTYPE="unknown"
-if ! mountpoint -q "$DB_MOUNT" && [[ "$DB_DIR" == "$DB_MOUNT"/* ]]; then
-  warn "$DB_MOUNT is not mounted - dataset step skipped (see the scratch disk step above)"
+step "db_bench dataset directory (node-local)"
+sudo mkdir -p "$DB_DIR"
+sudo chown "$(id -un):$(id -gn)" "$DB_DIR"
+DB_FSTYPE="$(stat -f -c %T "$DB_DIR" 2>/dev/null || echo unknown)"
+DB_FREE_GB="$(df -BG --output=avail "$DB_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')"
+echo "$DB_DIR: fstype=$DB_FSTYPE free=${DB_FREE_GB:-?} GB"
+case "$DB_FSTYPE" in
+  nfs*)
+    warn "$DB_DIR is on NFS. O_DIRECT is unreliable there and a ~41 GB dataset"
+    echo "         on the shared export takes every node down with ENOSPC."
+    echo "         Set DB_DIR to local storage." ;;
+  tmpfs|ramfs)
+    warn "$DB_DIR is on $DB_FSTYPE - that IS memory, so there is no I/O path"
+    echo "         and the tiering result would be meaningless." ;;
+esac
+if [[ -n "${DB_FREE_GB:-}" && "$DB_FREE_GB" -lt 60 ]]; then
+  warn "only ${DB_FREE_GB} GB free at $DB_DIR - the default 40M x 1 KB dataset"
+  echo "         is ~41 GB and compaction needs headroom on top."
+fi
+if [[ -f "$DB_DIR/CURRENT" ]]; then
+  echo "existing RocksDB dataset found - the harness will reuse it"
 else
-  sudo mkdir -p "$DB_DIR"
-  sudo chown -R "$(id -un):$(id -gn)" "$DB_DIR"
-  DB_FSTYPE="$(stat -f -c %T "$DB_DIR" 2>/dev/null || echo unknown)"
-  DB_FREE_GB="$(df -BG --output=avail "$DB_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')"
-  echo "$DB_DIR: fstype=$DB_FSTYPE free=${DB_FREE_GB:-?} GB"
-  case "$DB_FSTYPE" in
-    nfs*)
-      warn "$DB_DIR is on NFS. O_DIRECT is unreliable there and the dataset"
-      echo "         on the shared export can take every node down with ENOSPC." ;;
-    tmpfs|ramfs)
-      warn "$DB_DIR is on $DB_FSTYPE - that IS memory, so there is no I/O path"
-      echo "         and the tiering result would be meaningless." ;;
-  esac
-  if [[ "$SKIP_DB_LOAD" == "1" ]]; then
-    echo "SKIP_DB_LOAD=1 - not loading"
-  elif [[ ! -f "$DB_APP" ]]; then
-    warn "no $DB_APP - cannot load the dataset (copy app_db_bench.sh next to this script)"
-  elif [[ ! -x "$ROCKSDB_DIR/db_bench" ]]; then
-    warn "no db_bench binary - dataset not loaded"
-  else
-    # load mode is idempotent: it skips a stamped DB of the right shape and
-    # refuses (with instructions) on an unstamped or mismatching one.
-    echo "loading (or verifying) $DB_NUM x ${DB_VALUE_SIZE} B - a fresh load takes ~10 min"
-    mkdir -p "$HOME/db_load_logs"
-    OUT="$HOME/db_load_logs/$(hostname -s)" DB_MODE=load \
-      DB_BENCH="$ROCKSDB_DIR/db_bench" DB_DIR="$DB_DIR" DB_NUM="$DB_NUM" \
-      DB_KEY_SIZE="$DB_KEY_SIZE" DB_VALUE_SIZE="$DB_VALUE_SIZE" \
-      bash "$DB_APP" || warn "db_bench dataset load/verify failed - see output above"
-  fi
+  echo "no dataset yet - run-bench-variant.sh loads it once on first 'db' run"
 fi
 
 step "xsbench"
@@ -621,11 +507,7 @@ printf '%-28s %s\n' \
   "redis-server"  "$(command -v redis-server >/dev/null && echo ok || echo MISSING)" \
   "ycsb"          "$([[ -x $YCSB_DIR/bin/ycsb.sh ]] && echo ok || echo MISSING)" \
   "db_bench"      "$([[ -x $ROCKSDB_DIR/db_bench ]] && echo ok || echo MISSING)" \
-  "home fs"       "$(stat -f -c %T "$HOME" 2>/dev/null)" \
-  "scratch mount" "$(mountpoint -q "$DB_MOUNT" && findmnt -no SOURCE "$DB_MOUNT" || echo "NOT MOUNTED")" \
-  "rocksdb"       "$(rocksdb_version)" \
   "db dataset dir" "$DB_DIR ($DB_FSTYPE)" \
-  "db dataset"    "$([[ -f $DB_DIR/DATASET_STAMP ]] && awk -F= '$1=="num"||$1=="fill"{printf "%s=%s ", $1, $2}' "$DB_DIR/DATASET_STAMP" || echo "NOT LOADED")" \
   "xsbench"       "$([[ -x $XSBENCH_DIR/openmp-threading/XSBench ]] && echo ok || echo MISSING)" \
   "dlrm"          "$([[ -f $DLRM_DIR/dlrm_s_pytorch.py ]] && echo ok || echo MISSING)" \
   "dlrm venv"     "$([[ -x $DLRM_VENV/bin/python ]] && echo ok || echo MISSING)" \
@@ -641,13 +523,14 @@ fi
 cat <<EOF
 
 Next:
-  ./run-bench-variant.sh db hist 1 5          # dataset: $DB_DIR (loaded above)
+  DB_BENCH=$ROCKSDB_DIR/db_bench DB_DIR=$DB_DIR \\
+    ./run-bench-variant.sh db hist 1 5
   ./run-bench-variant.sh redis hist 1 5
   ./run-bench-variant.sh pr hist 1 5
   ./run-bench-variant.sh dlrm hist 1 5
   XS_BIN=$XSBENCH_DIR/openmp-threading/XSBench \\
   ./run-bench-variant.sh xsbench hist 1 5
 
-After a reboot only the runtime state is lost (this also remounts $DB_MOUNT):
+After a reboot only the runtime state is lost:
   ACTIVATE_ONLY=1 ./tiers_setup.sh
 EOF

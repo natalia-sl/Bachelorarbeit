@@ -2,7 +2,7 @@
 # run-bench-variant.sh - benchmark an arbitrary kernel VARIANT (not a static threshold).
 #
 # Usage:  ./run-bench-variant.sh <app> <variant> [cond] [reps]   (run with bash, NOT sh)
-#   app     : key from the APPS map below (pr, bfs, cc, bc, bfs_cc, redis, xsbench, dlrm, db)
+#   app     : key from the APPS map below (pr, bfs, cc, bc, bfs_cc, redis, xsbench, dlrm)
 #   variant : free-form label for what you're testing (histogram, static, stock, ...)
 #   cond    : 1 = THP never/never (default), 2 = THP always
 #   reps    : repetitions on this node (default 5)
@@ -12,9 +12,6 @@
 # Between every rep: zone_reclaim_mode, swapoff -a, sync, drop_caches=3.
 #   ZONE_RECLAIM_MODE=0|1   (default 1)  - a run CONDITION, see the guard below
 #   SYNC_MODE=targeted|full|none (default targeted) - full = bare global sync
-#
-# For db, the RocksDB dataset is loaded ONCE per node by tiers_setup.sh
-# (or: DB_MODE=load bash app_db_bench.sh) - never inside a rep.
 #
 # For bfs_cc, generate the graph ONCE first (not per rep):
 #   mkdir -p ~/graphs && ./gapbs/converter -u 27 -k 20 -b ~/graphs/u27k20.sg
@@ -30,7 +27,6 @@ declare -A APPS=(
   [redis]="bash app_redis_ycsb.sh"
   [xsbench]="bash app_xsbench.sh"
   [dlrm]="bash app_dlrm.sh"
-  [db]="bash app_db_bench.sh"
 )
 # ------------------------------------------------------------------------
 
@@ -93,24 +89,6 @@ XS_G="${XS_G:-100000}"                     # ~48.8 GiB footprint, ~1.9 GiB hot
 XS_PARTICLES="${XS_PARTICLES:-20000000}"   # 680M lookups
 XS_GRID="${XS_GRID:-unionized}"            # unionized | hash | nuclide
 XS_THREADS="${XS_THREADS:-$(awk -F, '{print NF}' <<<"$CORES")}"
-
-# RocksDB db_bench. The dataset lives on node-local SSD (/mydata), loaded once
-# per node by tiers_setup.sh; app_db_bench.sh refuses to run against a DB
-# without a matching DATASET_STAMP. DB_NUM / DB_KEY_SIZE / DB_VALUE_SIZE must
-# match the load. Defaults: 12M x 1 KB = ~11.7 GiB, all of it block cache.
-DB_BENCH="${DB_BENCH:-$HOME/rocksdb/db_bench}"
-DB_DIR="${DB_DIR:-/mydata/db_bench}"          # node-local SSD, NEVER NFS/tmpfs
-DB_NUM="${DB_NUM:-12000000}"
-DB_READ_NUM="${DB_READ_NUM:-$DB_NUM}"
-DB_KEY_SIZE="${DB_KEY_SIZE:-16}"
-DB_VALUE_SIZE="${DB_VALUE_SIZE:-1024}"
-DB_CACHE_GB="${DB_CACHE_GB:-16}"              # >= dataset: memory-bound, not I/O
-DB_DURATION="${DB_DURATION:-600}"
-DB_EXP_RANGE="${DB_EXP_RANGE:-8}"             # 0 = uniform control
-DB_BENCHMARK="${DB_BENCHMARK:-readrandom}"
-DB_WARMUP="${DB_WARMUP:-none}"                # none | readseq
-DB_SEED="${DB_SEED:-1}"
-DB_THREADS="${DB_THREADS:-$(awk -F, '{print NF}' <<<"$CORES")}"
 # ------------------------------------------------------------------------
 
 # --- NBP histogram instrumentation (harmless on non-histogram kernels) --
@@ -192,9 +170,9 @@ diagnose_hang() {
   echo "--- NFS / hung task messages ---"
   sudo dmesg 2>/dev/null | grep -iE 'nfs|hung task|blocked for more than' | tail -20 || echo "(none)"
   echo "--- benchmark processes (STAT D = uninterruptible; WCHAN = where it is stuck) ---"
-  ps -eo pid,ppid,stat,wchan:32,rss,etime,comm | grep -E 'bfs|cc|pr|bc|redis|java|python|perf|XSBench|db_bench' | grep -v grep
+  ps -eo pid,ppid,stat,wchan:32,rss,etime,comm | grep -E 'bfs|cc|pr|bc|redis|java|python|perf|XSBench' | grep -v grep
   echo "--- kernel stacks ---"
-  for pid in $(pgrep -f 'gapbs/(bfs|cc|pr|bc)|redis-server|dlrm_s_pytorch|XSBench|rocksdb/db_bench' 2>/dev/null); do
+  for pid in $(pgrep -f 'gapbs/(bfs|cc|pr|bc)|redis-server|dlrm_s_pytorch|XSBench' 2>/dev/null); do
     echo "pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null)):"
     sudo cat "/proc/$pid/stack" 2>/dev/null | head -20 || echo "  (stack unavailable)"
   done
@@ -211,16 +189,14 @@ kill_stragglers() {
   sudo pkill -f 'ycsb' 2>/dev/null || true
   sudo pkill -f 'dlrm_s_pytorch' 2>/dev/null || true
   sudo pkill -f 'XSBench' 2>/dev/null || true
-  sudo pkill -x db_bench 2>/dev/null || true
   sleep 3
   sudo pkill -9 -f 'gapbs/(bfs|cc|pr|bc)' 2>/dev/null || true
   sudo pkill -9 -f 'ycsb' 2>/dev/null || true
   sudo pkill -9 -f 'dlrm_s_pytorch' 2>/dev/null || true
   sudo pkill -9 -f 'XSBench' 2>/dev/null || true
-  sudo pkill -9 -x db_bench 2>/dev/null || true
   sleep 2
   echo "still running:"
-  ps -eo pid,stat,comm | grep -E 'bfs|cc|pr|redis|java|python|XSBench|db_bench' | grep -v grep || echo "(none)"
+  ps -eo pid,stat,comm | grep -E 'bfs|cc|pr|redis|java|python|XSBench' | grep -v grep || echo "(none)"
 }
 
 # record the runtime knob state - VAR is only a label, this is the ground truth
@@ -245,7 +221,6 @@ if [[ -z "${MAXSEC:-}" ]]; then
     redis) MAXSEC=10800 ;;
     dlrm)  MAXSEC=10800 ;;   # table init alone is minutes before the first iter
     xsbench) MAXSEC=7200 ;;   # the index-grid build is a SERIAL pass over 50 GB
-    db)    MAXSEC=5400 ;;   # optional readseq warm-up + DB_DURATION + stats dump
     *)     MAXSEC=3600  ;;
   esac
 fi
@@ -265,7 +240,7 @@ fi
 # A missing graph is no longer fatal: the GAP app scripts fall back to
 # generating in-process. Just say which mode this run is in, so the log
 # records it. Note the in-process peak is ~2x steady state per process.
-if [[ "$APP" != "xsbench" && "$APP" != "dlrm" && "$APP" != "db" && -n "$GRAPH" && ! -f "$GRAPH" ]]; then
+if [[ "$APP" != "xsbench" && "$APP" != "dlrm" && -n "$GRAPH" && ! -f "$GRAPH" ]]; then
   echo "NOTE: graph '$GRAPH' not found - GAP apps will generate in-process." >&2
   echo "      To use a file instead: ./gapbs/converter -u 27 -k 20 -b $GRAPH  (~22.5 GB)" >&2
 fi
@@ -276,31 +251,6 @@ if [[ "$APP" == "xsbench" ]]; then
     unionized|hash|nuclide) : ;;
     *) echo "ERROR: XS_GRID='$XS_GRID' - expected unionized, hash or nuclide" >&2; exit 1 ;;
   esac
-fi
-
-# db_bench: binary, a STAMPED dataset of the right shape, on local storage.
-# app_db_bench.sh re-checks the stamp, but under sudo inside rep 1.
-if [[ "$APP" == "db" ]]; then
-  [[ -x "$DB_BENCH" ]] || { echo "ERROR: no db_bench at $DB_BENCH - run ./tiers_setup.sh" >&2; exit 1; }
-  if ! mountpoint -q "$(dirname "$DB_DIR")" && [[ "$DB_DIR" == /mydata/* ]]; then
-    echo "ERROR: /mydata is not mounted (lost on reboot?) - run ACTIVATE_ONLY=1 ./tiers_setup.sh" >&2
-    exit 1
-  fi
-  [[ -f "$DB_DIR/CURRENT" && -f "$DB_DIR/DATASET_STAMP" ]] || {
-    echo "ERROR: no stamped RocksDB dataset in $DB_DIR - run ./tiers_setup.sh" >&2
-    echo "       (or: DB_DIR=$DB_DIR DB_NUM=$DB_NUM DB_MODE=load bash app_db_bench.sh)" >&2
-    exit 1; }
-  db_fs=$(stat -f -c %T "$DB_DIR")
-  case "$db_fs" in
-    nfs*|tmpfs|ramfs) echo "ERROR: $DB_DIR is on $db_fs" >&2; exit 1 ;;
-  esac
-  st_num=$(awk -F= '$1=="num"{print $2}' "$DB_DIR/DATASET_STAMP")
-  st_key=$(awk -F= '$1=="key_size"{print $2}' "$DB_DIR/DATASET_STAMP")
-  if [[ "$st_key" != "$DB_KEY_SIZE" || "$DB_READ_NUM" -gt "${st_num:-0}" ]]; then
-    echo "ERROR: dataset is num=$st_num key_size=$st_key, this run wants" >&2
-    echo "       read_num=$DB_READ_NUM key_size=$DB_KEY_SIZE" >&2
-    exit 1
-  fi
 fi
 
 # DLRM needs its interpreter and its checkout to exist BEFORE the reps start;
@@ -465,25 +415,6 @@ pct() { awk -v ev="$1" '{ci=0;pi=0;for(i=1;i<=NF;i++){if($i==ev)ci=i-1;if($i=="#
       echo "      Control case; it should NOT produce a stable histogram peak."
     fi
   fi
-  if [[ "$APP" == "db" ]]; then
-    echo "--- db_bench config ---"
-    echo "binary    = $DB_BENCH"
-    echo "db_dir    = $DB_DIR ($(stat -f -c %T "$DB_DIR"), $(du -sh "$DB_DIR" 2>/dev/null | cut -f1))"
-    echo "dataset   : $(tr '\n' ' ' < "$DB_DIR/DATASET_STAMP")"
-    echo "benchmark=$DB_BENCHMARK warmup=$DB_WARMUP duration=${DB_DURATION}s threads=$DB_THREADS"
-    echo "cache=${DB_CACHE_GB}GB read_num=$DB_READ_NUM exp_range=$DB_EXP_RANGE seed=$DB_SEED"
-    if [[ "$DB_EXP_RANGE" != "0" ]]; then
-      awk -v R="$DB_EXP_RANGE" 'BEGIN{printf "skew      : top 1%% of keys ~ %.0f%% of reads, top 10%% ~ %.0f%%\n", \
-          (R>log(100)?100*(1-log(100)/R):0), (R>log(10)?100*(1-log(10)/R):0)}'
-    else
-      echo "skew      : uniform (control) - no hot set beyond index/filter blocks"
-    fi
-    n0_tot=$(awk '/MemTotal/{print int($4/1024)}' /sys/devices/system/node/node0/meminfo)
-    echo "node0 total = ${n0_tot} MB    free now: node0 $(node_free_mb 0) MB / node1 $(node_free_mb 1) MB"
-    if [[ $(( DB_CACHE_GB * 1024 )) -le ${n0_tot:-0} ]]; then
-      echo "WARNING: block cache fits in node 0 - nothing will need tiering."
-    fi
-  fi
   echo "--- zone reclaim ---"
   sudo sh -c "echo $ZONE_RECLAIM_MODE > /proc/sys/vm/zone_reclaim_mode"
   echo -n "zone_reclaim_mode  = "; cat /proc/sys/vm/zone_reclaim_mode
@@ -604,7 +535,6 @@ for rep in $(seq 1 "$REPS"); do
     case "$APP" in
       xsbench) PLACE_PROC="XSBench"; PLACE_MATCH="-x" ;;
       dlrm)    PLACE_PROC="dlrm_s_pytorch"; PLACE_MATCH="-f" ;;
-      db)      PLACE_PROC="db_bench"; PLACE_MATCH="-x" ;;
       *)       PLACE_PROC=""; PLACE_MATCH="-x" ;;
     esac
     (
@@ -683,20 +613,6 @@ for rep in $(seq 1 "$REPS"); do
                XS_PARTICLES="$XS_PARTICLES" \
                XS_GRID="$XS_GRID" \
                XS_THREADS="$XS_THREADS" \
-               DB_MODE=run \
-               DB_BENCH="$DB_BENCH" \
-               DB_DIR="$DB_DIR" \
-               DB_NUM="$DB_NUM" \
-               DB_READ_NUM="$DB_READ_NUM" \
-               DB_KEY_SIZE="$DB_KEY_SIZE" \
-               DB_VALUE_SIZE="$DB_VALUE_SIZE" \
-               DB_CACHE_GB="$DB_CACHE_GB" \
-               DB_DURATION="$DB_DURATION" \
-               DB_EXP_RANGE="$DB_EXP_RANGE" \
-               DB_BENCHMARK="$DB_BENCHMARK" \
-               DB_WARMUP="$DB_WARMUP" \
-               DB_SEED="$DB_SEED" \
-               DB_THREADS="$DB_THREADS" \
            taskset -c "$CORES" $CMD 2>&1 | tee -a "$log"
     APP_RC=${PIPESTATUS[0]}
 
@@ -803,9 +719,6 @@ for rep in $(seq 1 "$REPS"); do
     elif [[ "$APP" == "dlrm" ]]; then
         # seconds per iteration, warm-up window already excluded by the app script
         avg=$(grep -m1 '^\[DLRM\] Average Time' "$log" | awk '{print $NF}')
-    elif [[ "$APP" == "db" ]]; then
-        # MICROSECONDS per op of the measured benchmark (not seconds)
-        avg=$(grep -m1 '^\[DBBENCH\] Average Time' "$log" | awk '{print $NF}')
     else
         avg=$(grep -m1 'Average Time' "$log" | awk '{print $NF}')
     fi
@@ -829,25 +742,12 @@ for rep in $(seq 1 "$REPS"); do
       echo "$NODE,$VAR,$COND,$rep,$XS_GRID,$XS_G,$XS_PARTICLES,${xs_mem:-NA},${avg:-NA},${xs_fom:-NA},${xs_sum:-NA}" >> "$XSCSV"
     fi
 
-    # db_bench: throughput is higher-is-better and the tail latencies are the
-    # metrics tiering moves most, so they get their own file like XSBench.
-    # Join on (node,variant,condition,rep).
-    if [[ "$APP" == "db" ]]; then
-      DBCSV="$OUTDIR/dbbench.csv"
-      [[ -f "$DBCSV" ]] || echo "node,variant,condition,rep,exp_range,cache_gb,warmup,threads,duration_s,micros_per_op,ops_per_sec,p50_us,p99_us,p999_us,found,lookups,block_cache_hit_pct" > "$DBCSV"
-      m="$APPOUT/dbbench_metrics.txt"
-      mv_() { awk -F= -v k="$1" '$1==k{print $2}' "$m" 2>/dev/null | head -1; }
-      echo "$NODE,$VAR,$COND,$rep,$DB_EXP_RANGE,$DB_CACHE_GB,$DB_WARMUP,$DB_THREADS,$DB_DURATION,$(mv_ micros_per_op),$(mv_ ops_per_sec),$(mv_ p50_us),$(mv_ p99_us),$(mv_ p999_us),$(mv_ found),$(mv_ lookups),$(mv_ block_cache_hit_pct)" >> "$DBCSV"
-    fi
-
     ZCSV="$OUTDIR/zones.csv"
     [[ -f "$ZCSV" ]] || echo "node,app,variant,condition,rep,adaptive_bounds,always_ms_end,if_free_ms_end,peak_bucket_end,always_delta,if_free_ok_delta,if_free_no_delta,never_delta,warmup_delta" > "$ZCSV"
     echo "$NODE,$APP,$VAR,$COND,$rep,${ab_on},${always_end},${if_free_end},${peak_end},${ZONE_DELTAS}" >> "$ZCSV"
 
     # the app ran under sudo, so its logs came out root-owned; hand them back
     sudo chown -R "$(id -un):$(id -gn)" "$OUTDIR" 2>/dev/null || true
-    # db_bench ran as root and wrote LOG/MANIFEST/OPTIONS into the dataset dir
-    [[ "$APP" == "db" ]] && { sudo chown -R "$(id -un):$(id -gn)" "$DB_DIR" 2>/dev/null || true; }
 done
 
 echo ">>> done. logs + setup.log + knobs.txt + summary.csv + zones.csv + per-rep hist traces in $OUTDIR"
